@@ -1,8 +1,8 @@
 @echo off
 chcp 65001 >nul
 title 语音字幕工作站 凡哥制作
-REM FireRedASR2S 项目版权所有 (c) 2026 FireRedTeam (原作者)
-REM 本启动脚本为二次开发内容，基于 Apache 2.0 协议发布
+REM:: FireRedASR2S 项目版权所有 (c) 2026 FireRedTeam (原作者)
+REM:: 本启动脚本为二次开发内容，基于 Apache 2.0 协议发布
 
 color 0B
 setlocal enabledelayedexpansion
