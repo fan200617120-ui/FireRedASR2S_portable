@@ -1,6 +1,21 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
+FireRedASR2S WebUI Professional Edition
+Copyright 2026 光影的故事2018
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
 模型下载脚本 - 手动运行
 下载 FireRedASR2-AED、FireRedVAD、FireRedLID、FireRedPunc 以及可选的 FireRedASR2-LLM
 """
@@ -51,7 +66,7 @@ def download_models(source_choice, download_llm):
     if source_choice == '1':
         # 国内用户 (ModelScope)
         print("\n使用 ModelScope 下载，适合国内用户")
-        if not run_cmd([str(PYTHON_EXE), "-m", "pip", "install", "-U", "modelscope"]):
+        if not run_cmd([str(PYTHON_EXE), "-m", "pip", "install", "-U", "modelscope", "-i", "https://pypi.tuna.tsinghua.edu.cn/simple"]):
             return False
         modelscope_exe = SCRIPTS_DIR / "modelscope.exe"
         if not modelscope_exe.exists():
@@ -77,7 +92,7 @@ def download_models(source_choice, download_llm):
     else:
         # 国际用户 (Hugging Face)
         print("\n使用 Hugging Face 下载，适合国际用户")
-        if not run_cmd([str(PYTHON_EXE), "-m", "pip", "install", "-U", "huggingface_hub[cli]"]):
+        if not run_cmd([str(PYTHON_EXE), "-m", "pip", "install", "-U", "huggingface_hub[cli]", "-i", "https://pypi.tuna.tsinghua.edu.cn/simple"]):
             return False
         cli_exe = SCRIPTS_DIR / "huggingface-cli.exe"
         if not cli_exe.exists():
