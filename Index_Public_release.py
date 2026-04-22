@@ -1,3 +1,22 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+FireRedASR2S WebUI Professional Edition
+Copyright 2026 光影的故事2018
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
 import gradio as gr
 import subprocess
 import sys
@@ -11,6 +30,7 @@ if not PYTHON_EXE.exists():
     PYTHON_EXE = sys.executable  # 降级到系统 Python
 
 SCRIPTS_DIR = BASE_DIR / "scripts"
+OUTPUT_DIR = BASE_DIR / "output"   # 输出目录
 
 def launch_script(script_name):
     """启动指定脚本"""
@@ -22,6 +42,26 @@ def launch_script(script_name):
         return f"✅ 已启动 {script_name}，请查看新窗口"
     except Exception as e:
         return f"❌ 启动失败：{e}"
+
+def open_directory(dir_path):
+    """在文件管理器中打开指定目录"""
+    path = Path(dir_path).resolve()
+    if not path.exists():
+        # 如果目录不存在，尝试创建
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return f"❌ 无法创建目录：{path}"
+    try:
+        if sys.platform == "win32":
+            subprocess.Popen(["explorer", str(path)])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(path)])
+        else:
+            subprocess.Popen(["xdg-open", str(path)])
+        return f"✅ 已打开目录：{path}"
+    except Exception as e:
+        return f"❌ 打开失败：{e}"
 
 def refresh_status():
     """刷新系统状态（可扩展为获取CPU/内存等信息）"""
@@ -126,11 +166,15 @@ with gr.Blocks(css=custom_css, title="语音字幕工作站") as demo:
         # 按钮组
         with gr.Column(elem_classes="btn-group"):
             btn_asr = gr.Button("📄 语音转字幕", elem_id="btn_asr")
+            btn_align = gr.Button("🎬 字幕自动打轴", elem_id="btn_align")  
             btn_clean = gr.Button("✨ 字幕清洗", elem_id="btn_clean")
             btn_trans = gr.Button("🔤 字幕转换", elem_id="btn_trans")
             # 新增按钮（请将对应的脚本放入 scripts 目录）
             btn_translate = gr.Button("🤖 在线AI助手", elem_id="btn_translate")
             btn_json_extract = gr.Button("📋 双语字幕API版", elem_id="btn_json_extract")
+            # 新增：打开根目录和 output 目录
+            btn_open_root = gr.Button("📂 打开根目录", elem_id="btn_open_root")
+            btn_open_output = gr.Button("📁 打开输出目录", elem_id="btn_open_output")
 
         # 状态显示
         status = gr.Textbox(
@@ -169,10 +213,14 @@ with gr.Blocks(css=custom_css, title="语音字幕工作站") as demo:
 
     # ==================== 绑定点击事件 ====================
     btn_asr.click(fn=lambda: launch_script("firered_webui_pro.py"), outputs=status)
+    btn_align.click(fn=lambda: launch_script("fireRed_align_dual.py"), outputs=status)  
     btn_clean.click(fn=lambda: launch_script("clean_subtitle.py"), outputs=status)
     btn_trans.click(fn=lambda: launch_script("subtitle_utils.py"), outputs=status)
     btn_translate.click(fn=lambda: launch_script("AI_translator.py"), outputs=status)
-    btn_json_extract.click(fn=lambda: launch_script("subtitle_translator_pro.py"), outputs=status)    
+    btn_json_extract.click(fn=lambda: launch_script("subtitle_translator_pro.py"), outputs=status)
+    # 新按钮事件：打开根目录和 output 目录
+    btn_open_root.click(fn=lambda: open_directory(BASE_DIR), outputs=status)
+    btn_open_output.click(fn=lambda: open_directory(OUTPUT_DIR), outputs=status)
 
 
 if __name__ == "__main__":
