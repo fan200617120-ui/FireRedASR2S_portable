@@ -1,19 +1,22 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-FireRedASR2S WebUI 专业版 (最终增强版) - 含强制对齐与智能合并
-- 保留原有所有功能
-- 新增字幕预览标签页，支持音频播放与字幕高亮同步
-- 新增视频字幕处理：从视频提取音频→识别→嵌入字幕（软/硬）
-- 新增强制对齐功能：用稿子生成精准字幕，支持自定义合并规则（含空行断句、字数限制、时长限制）
-- 新增自定义输出目录、错误日志、配置保存/加载功能
-- 改进：空行断句恢复为精确 token 匹配，确保分段稳定
-- 改进：FFmpeg 自动配置便携版，无需用户手动添加 PATH
-- 改进：字幕预览对大文件进行保护，阈值可配置
-- 改进：LLM 模型选项仅在目录存在时显示，避免误导
-- 改进：视频处理临时文件确保清理
-- 改进：日志自动清理旧文件
-- 改进：统一所有输出文件名格式（原文件名+时间戳+描述符）
+FireRedASR2S WebUI Professional Edition
+Copyright 2026 光影的故事2018
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+FireRedASR2S WebUI 专业版 (增强版) 
 - 基于 fireredasr2s 模块
 - 增加高级参数折叠面板，支持解码、VAD、Punc 微调
 本软件包 (FireRedASR2S 便携版) 包含以下部分：
@@ -87,7 +90,10 @@ config_lock = threading.RLock()
 
 # ==================== 自动配置 FFmpeg ====================
 PORTABLE_FFMPEG_DIR = ROOT_DIR / "ffmpeg" / "bin"
-PORTABLE_FFMPEG_EXE = PORTABLE_FFMPEG_DIR / "ffmpeg.exe"
+if sys.platform == "win32":
+    PORTABLE_FFMPEG_EXE = PORTABLE_FFMPEG_DIR / "ffmpeg.exe"
+else:
+    PORTABLE_FFMPEG_EXE = PORTABLE_FFMPEG_DIR / "ffmpeg"
 if PORTABLE_FFMPEG_EXE.exists():
     os.environ["PATH"] = str(PORTABLE_FFMPEG_DIR) + os.pathsep + os.environ.get("PATH", "")
     FFMPEG_PATH = str(PORTABLE_FFMPEG_EXE)
@@ -99,7 +105,7 @@ else:
         print(f"✅ 使用系统已安装的 FFmpeg: {FFMPEG_PATH}")
     else:
         FFMPEG_PATH = "ffmpeg"
-        print("⚠️ 警告：未找到内置 FFmpeg，视频处理可能失败，请将 ffmpeg.exe 放入 ffmpeg/bin 目录。")
+        print("⚠️ 警告：未找到内置 FFmpeg，视频处理可能失败，请将 ffmpeg 放入 ffmpeg/bin 目录。")
 
 # ==================== 加载/保存配置 ====================
 def load_settings():
@@ -147,6 +153,20 @@ class FireRedASR2SManager:
         self.temp_files = []
         self.settings = load_settings()
 
+    def _find_model_dir(self, model_type="AED"):
+        """自动查找模型目录（借鉴 align_dual）"""
+        candidates = [
+            ROOT_DIR / "pretrained_models" / f"FireRedASR2-{model_type}",
+            ROOT_DIR / "pretrained_models" / f"FireRedASR2-{model_type}-2025",
+            ROOT_DIR / "pretrained_models" / "FireRedASR2-AED",
+            ROOT_DIR / "pretrained_models" / "FireRedASR2-AED-2025",
+        ]
+        for p in candidates:
+            if p.exists():
+                print(f"✅ 自动检测到模型目录: {p}")
+                return str(p)
+        return None
+
     def load_system(self, config_dict=None, advanced_params=None):
         with self.lock:
             if self.asr_system is not None:
@@ -163,9 +183,14 @@ class FireRedASR2SManager:
                 if config_dict:
                     default_config.update(config_dict)
 
-                model_dir = ROOT_DIR / "pretrained_models" / f"FireRedASR2-{default_config['asr_model_type'].upper()}"
-                if not model_dir.exists():
-                    return False, f"模型目录不存在: {model_dir}，请先下载对应模型"
+                # 使用自动查找或手动指定
+                model_dir_override = config_dict.get("model_dir", None) if config_dict else None
+                if model_dir_override and Path(model_dir_override).exists():
+                    model_dir = model_dir_override
+                else:
+                    model_dir = self._find_model_dir(default_config['asr_model_type'].upper())
+                if not model_dir or not Path(model_dir).exists():
+                    return False, f"模型目录不存在，请将模型放置在 pretrained_models/FireRedASR2-AED 等目录"
 
                 vad_config = FireRedVadConfig(use_gpu=default_config["use_gpu"])
                 lid_config = FireRedLidConfig(use_gpu=default_config["use_gpu"])
@@ -201,12 +226,20 @@ class FireRedASR2SManager:
                         vad_config.speech_threshold = advanced_params["vad_speech_threshold"]
                     if "vad_smooth_window_size" in advanced_params:
                         vad_config.smooth_window_size = advanced_params["vad_smooth_window_size"]
-                    # punc_threshold 可能不存在于 FireRedPuncConfig 中，但用户要求保留界面显示，故此处保留但可能无效
                     if "punc_threshold" in advanced_params:
-                        punc_config.threshold = advanced_params["punc_threshold"]
+                        try:
+                            punc_config.threshold = advanced_params["punc_threshold"]
+                        except:
+                            pass
+
+                vad_model_dir = str(ROOT_DIR / "pretrained_models" / "FireRedVAD" / "vad")
+                if not os.path.exists(vad_model_dir):
+                    alt_vad_dir = str(ROOT_DIR / "pretrained_models" / "FireRedVAD" / "VAD")
+                    if os.path.exists(alt_vad_dir):
+                        vad_model_dir = alt_vad_dir
 
                 system_config = FireRedAsr2SystemConfig(
-                    vad_model_dir=str(ROOT_DIR / "pretrained_models" / "FireRedVAD" / "VAD"),
+                    vad_model_dir=vad_model_dir,
                     lid_model_dir=str(ROOT_DIR / "pretrained_models" / "FireRedLID"),
                     asr_model_dir=str(model_dir),
                     punc_model_dir=str(ROOT_DIR / "pretrained_models" / "FireRedPunc"),
@@ -228,11 +261,14 @@ class FireRedASR2SManager:
 
     def unload_system(self):
         with self.lock:
+            if self.asr_system is not None:
+                del self.asr_system
             self.asr_system = None
             self.config = None
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats()
             return True, "系统已卸载"
 
     def transcribe(self, audio_input, **kwargs):
@@ -246,54 +282,67 @@ class FireRedASR2SManager:
             return result, audio_path, None
         except Exception as e:
             logging.error(traceback.format_exc())
+            if audio_path in self.temp_files:
+                self.temp_files.remove(audio_path)
+                try:
+                    os.unlink(audio_path)
+                except:
+                    pass
             return None, None, f"识别失败: {str(e)}"
 
-    def _prepare_audio(self, audio_input):
-        if isinstance(audio_input, str) and os.path.exists(audio_input):
-            try:
-                data, sr = librosa.load(audio_input, sr=None)
-                if sr != 16000:
-                    data = librosa.resample(data.astype(np.float32), orig_sr=sr, target_sr=16000)
-                    sr = 16000
-                temp_hash = hashlib.md5(data.tobytes() + str(time.time()).encode()).hexdigest()[:8]
-                temp_path = os.path.join(tempfile.gettempdir(), f"firered_temp_{temp_hash}.wav")
-                sf.write(temp_path, data, sr)
-                self.temp_files.append(temp_path)
-                return temp_path
-            except Exception as e:
-                print(f"音频文件转换失败: {e}")
-                return None
-        if isinstance(audio_input, tuple):
-            try:
+    def _prepare_audio(self, audio_input, return_waveform=False):
+        """使用 FFmpeg 预处理为 16k 单声道 wav（借鉴 align_dual），兼容 filepath 和 numpy 数组"""
+        try:
+            if isinstance(audio_input, str) and os.path.exists(audio_input):
+                # 文件路径：直接用 FFmpeg 转
+                input_path = audio_input
+            elif isinstance(audio_input, tuple):
+                # 从 Gradio Audio(type="numpy") 传过来的 (sr, data)
                 sr, data = audio_input
                 if data.ndim > 1:
                     data = np.mean(data, axis=1)
-                if sr != 16000:
-                    data = librosa.resample(data.astype(np.float32), orig_sr=sr, target_sr=16000)
-                    sr = 16000
-                temp_hash = hashlib.md5(data.tobytes() + str(time.time()).encode()).hexdigest()[:8]
-                temp_path = os.path.join(tempfile.gettempdir(), f"firered_temp_{temp_hash}.wav")
-                sf.write(temp_path, data, sr)
-                self.temp_files.append(temp_path)
-                return temp_path
-            except Exception as e:
-                print(f"音频转换失败: {e}")
+                # 先写入临时文件
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+                    input_path = tmp.name
+                sf.write(input_path, data.astype(np.float32), sr)
+                self.temp_files.append(input_path)
+            else:
                 return None
-        return None
+
+            # 用 FFmpeg 生成标准化的临时文件
+            with tempfile.NamedTemporaryFile(delete=False, suffix="_16k_mono.wav") as tmp_out:
+                out_path = tmp_out.name
+            cmd = [
+                FFMPEG_PATH, "-y", "-i", input_path,
+                "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", out_path
+            ]
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.temp_files.append(out_path)
+
+            if return_waveform:
+                data, sr = sf.read(out_path, dtype='float32')
+                return out_path, data, sr
+            else:
+                return out_path
+        except Exception as e:
+            logging.error(f"音频预处理失败: {e}")
+            return None
 
     def cleanup_temp(self):
         cleaned = 0
         for f in self.temp_files[:]:
             try:
-                os.unlink(f)
-                self.temp_files.remove(f)
-                cleaned += 1
+                if os.path.exists(f):
+                    os.unlink(f)
+                    cleaned += 1
             except:
                 pass
+        self.temp_files = []
         return cleaned
 
     # ==================== 强制对齐方法 ====================
     def _seconds_to_srt_time(self, seconds):
+        seconds = max(0.0, float(seconds))
         td = timedelta(seconds=seconds)
         total_seconds = int(td.total_seconds())
         hours = total_seconds // 3600
@@ -308,17 +357,16 @@ class FireRedASR2SManager:
         if self.config['asr_model_type'] != 'aed':
             return None, None, None, None, "强制对齐仅支持 AED 模型，当前为 " + self.config['asr_model_type']
 
-        audio_path = self._prepare_audio(audio_input)
-        if audio_path is None:
+        audio_path, waveform, sr = self._prepare_audio(audio_input, return_waveform=True)
+        if audio_path is None or waveform is None:
             return None, None, None, None, "音频处理失败"
 
         try:
-            waveform, sr = librosa.load(audio_path, sr=16000, mono=True)
             duration = len(waveform) / 16000
 
             asr = self.asr_system.asr
 
-            feats, lengths, durs, _, _ = asr.feat_extractor([(16000, waveform)], ["tmp"])
+            feats, lengths, _, _, _ = asr.feat_extractor([(16000, waveform)], ["tmp"])
             if not isinstance(lengths, torch.Tensor):
                 lengths = torch.tensor(lengths, dtype=torch.long)
             else:
@@ -333,6 +381,8 @@ class FireRedASR2SManager:
             with torch.no_grad():
                 enc_outputs, enc_lengths, _ = asr.model.encoder(feats, lengths)
                 T = enc_outputs.size(1)
+                if T == 0:
+                    return None, None, None, None, "音频过短，无法对齐（编码器输出长度为0）"
                 frame_shift = duration / T
 
             tokens, token_ids = asr.tokenizer.tokenize(reference_text)
@@ -351,7 +401,7 @@ class FireRedASR2SManager:
             if len(starts) == 0:
                 return None, None, None, None, "时间戳为空"
 
-            # 时间戳单位检测
+            # 增强的时间戳单位检测
             print("\n" + "="*50)
             print("[调试] 开始时间戳单位检测")
             print(f"[调试] 音频时长 duration = {duration:.3f}s")
@@ -362,7 +412,7 @@ class FireRedASR2SManager:
             min_start = min(starts)
             print(f"[调试] 原始时间戳范围: {min_start:.3f} - {max_start:.3f}")
 
-            if max_start <= duration * 1.2:
+            if max_start <= duration * 1.5 and max_start > 0.01 * duration:
                 print("[调试] ✅ 检测到原始值接近音频时长，按秒单位处理")
                 timestamps_sec = list(zip(starts, ends))
             else:
@@ -372,9 +422,13 @@ class FireRedASR2SManager:
                     print("[调试] ✅ 按帧编号处理")
                     timestamps_sec = [(s * frame_shift, e * frame_shift) for s, e in zip(starts, ends)]
                 else:
-                    scale = duration / max_start * 0.95
-                    print(f"[调试] ✅ 按未知单位缩放，系数 = {scale:.6f}")
-                    timestamps_sec = [(s * scale, e * scale) for s, e in zip(starts, ends)]
+                    if max_start > duration * 1000:
+                        scale = duration / max_start * 0.99
+                        print(f"[调试] ✅ 按未知单位缩放，系数 = {scale:.6f}")
+                        timestamps_sec = [(s * scale, e * scale) for s, e in zip(starts, ends)]
+                    else:
+                        print("[调试] ⚠️ 无法确定单位，保守使用帧编号")
+                        timestamps_sec = [(s * frame_shift, e * frame_shift) for s, e in zip(starts, ends)]
 
             if timestamps_sec:
                 converted_max = max(e for _, e in timestamps_sec)
@@ -405,7 +459,12 @@ class FireRedASR2SManager:
             else:
                 sentence_srt = ""
 
-            # ---------- 修改：使用统一命名函数生成文件名 ----------
+            # 显存清理（借鉴 align_dual）
+            del feats, enc_outputs, enc_lengths, yseq
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
             timestamp_str = time.strftime("%Y%m%d_%H%M%S")
             prefix = generate_output_filename(audio_input, timestamp_str, default_name="align")
             word_path = ALIGN_OUTPUT_DIR / f"{prefix}_words.srt"
@@ -422,12 +481,17 @@ class FireRedASR2SManager:
             return None, None, None, None, f"强制对齐失败: {str(e)}"
         finally:
             if audio_path in self.temp_files:
-                self.cleanup_temp()
+                self.temp_files.remove(audio_path)
+                try:
+                    os.unlink(audio_path)
+                except:
+                    pass
 
 manager = FireRedASR2SManager()
 
 # ==================== 工具函数 ====================
 def seconds_to_srt_time(seconds):
+    seconds = max(0.0, float(seconds))
     td = timedelta(seconds=seconds)
     total_seconds = int(td.total_seconds())
     hours = total_seconds // 3600
@@ -474,7 +538,7 @@ def format_result_to_outputs(result):
     srt_text = "\n".join(srt_lines)
 
     extra = f"VAD段: {len(vad_segments)}"
-    if sentences and "asr_confidence" in sentences[0]:
+    if sentences and sentences[0].get("asr_confidence") is not None:
         extra += f" | 置信度: {sentences[0]['asr_confidence']:.3f}"
     full_text = f"{text}\n\n[元数据] {extra}"
 
@@ -484,9 +548,8 @@ def generate_subtitle_html(segments, audio_path, max_size_mb=None):
     if not audio_path or not os.path.exists(audio_path) or not segments:
         return '<div style="padding:20px; text-align:center; color:#999;">暂无字幕预览</div>'
 
-    # 从设置中读取阈值，若未传入则使用默认值
     if max_size_mb is None:
-        max_size_mb = manager.settings.get("preview_max_size_mb", 5)
+        max_size_mb = manager.settings.get("preview_max_size_mb", 20)
 
     try:
         size = os.path.getsize(audio_path) / (1024 * 1024)
@@ -710,33 +773,21 @@ def sentences_to_srt(sentences):
 
 # ==================== 统一文件名生成函数 ====================
 def generate_output_filename(base_input, timestamp_str, custom_suffix="", default_name="recording"):
-    """
-    根据输入（文件路径、字典或 None）生成安全的文件名前缀（不含扩展名）
-    - base_input: 原始输入，可能是文件路径字符串、Gradio 音频字典或 None
-    - timestamp_str: 时间戳字符串，如 '20250313_153045'
-    - custom_suffix: 自定义后缀，如 'soft' 或 'hard'，可为空
-    - default_name: 当无法提取原文件名时使用的默认名称
-    返回: 安全的前缀字符串，例如 'meeting_20250313_153045_soft'
-    """
-    # 尝试提取原始文件名
     original_name = None
     if isinstance(base_input, str) and os.path.exists(base_input):
         original_name = Path(base_input).stem
     elif isinstance(base_input, dict) and base_input.get('path') and os.path.exists(base_input['path']):
         original_name = Path(base_input['path']).stem
     elif isinstance(base_input, tuple):
-        # 麦克风录制的音频，使用默认名称
         original_name = default_name
 
     if not original_name:
         original_name = default_name
 
-    # 去除非法字符（允许中文、字母、数字、下划线、连字符）
     safe_name = re.sub(r'[^\w\u4e00-\u9fff\-]', '', original_name)
     if not safe_name:
         safe_name = default_name
 
-    # 组装前缀
     parts = [safe_name, timestamp_str]
     if custom_suffix:
         parts.append(custom_suffix)
@@ -776,10 +827,16 @@ def ensure_model_loaded(asr_model_type, use_gpu, use_half,
         "punc_threshold": punc_threshold,
     }
     with manager.lock:
-        if manager.asr_system is None or manager.config != config:
+        need_reload = manager.asr_system is None
+        if not need_reload:
+            for k, v in config.items():
+                if manager.config.get(k) != v:
+                    need_reload = True
+                    break
+        if need_reload:
             if manager.asr_system is not None:
                 manager.unload_system()
-            if progress:
+            if progress is not None and getattr(progress, 'tqdm', None) is not None:
                 progress(0.1, desc="加载模型...")
             success, msg = manager.load_system(config, advanced)
             if not success:
@@ -828,7 +885,6 @@ def transcribe_audio(audio, asr_model_type, use_gpu, use_half, enable_vad, enabl
     saved = save_outputs(base_name, full_text, timestamps_json, srt_text,
                          language="自动检测", model_info=asr_model_type)
 
-    # 使用配置的预览阈值
     preview_max_size = manager.settings.get("preview_max_size_mb", 5)
     subtitle_html = generate_subtitle_html(segments, audio_path, preview_max_size)
 
@@ -847,13 +903,13 @@ def transcribe_audio(audio, asr_model_type, use_gpu, use_half, enable_vad, enabl
     progress(1.0, desc="完成")
     return full_text, timestamps_json, srt_text, subtitle_html
 
-# ==================== 视频字幕处理函数 ====================
+# ==================== 视频字幕处理函数（仅提取音频并生成字幕，不烧录）====================
 def transcribe_video(video, asr_model_type, use_gpu, use_half, enable_vad, enable_lid, enable_punc,
                      beam_size, nbest, decode_max_len, softmax_smoothing, aed_length_penalty,
                      eos_penalty, elm_weight,
                      vad_min_speech_frame, vad_max_speech_frame, vad_min_silence_frame,
                      vad_speech_threshold, vad_smooth_window_size,
-                     punc_threshold, subtitle_mode,
+                     punc_threshold, subtitle_mode,   # subtitle_mode 保留参数但忽略
                      progress=gr.Progress()):
     temp_audio_path = None
     try:
@@ -914,56 +970,16 @@ def transcribe_video(video, asr_model_type, use_gpu, use_half, enable_vad, enabl
         if saved.get('srt'):
             save_info += f"  {Path(saved['srt']).name}\n"
 
-        progress(0.8, desc="嵌入字幕...")
-        srt_path = saved.get('srt')
-        if srt_path is None:
-            result_msg = f"处理完成，但未生成字幕（可能音频无语音）。\n{save_info}"
-            progress(0.9, desc="清理...")
-            manager.cleanup_temp()
-            combined_text = f"{result_msg}\n\n【识别文本】\n{full_text}"
-            progress(1.0, desc="完成")
-            return combined_text, timestamps_json, srt_text
-
-        # ---------- 修改：使用统一命名函数生成视频文件名 ----------
-        timestamp_str = time.strftime("%Y%m%d_%H%M%S")
-        prefix = generate_output_filename(video, timestamp_str, subtitle_mode, default_name="video")
-        out_filename = f"{prefix}.mp4"
-        out_path = OUTPUT_DIR / out_filename
-
-        srt_path_str = str(srt_path).replace('\\', '/')
-        video_path_str = str(video).replace('\\', '/')
-        out_path_str = str(out_path).replace('\\', '/')
-
-        if subtitle_mode == "soft":
-            cmd = [
-                str(FFMPEG_PATH), "-i", video_path_str,
-                "-i", srt_path_str,
-                "-c", "copy", "-c:s", "mov_text",
-                "-metadata:s:s:0", "language=chi",
-                "-y", out_path_str
-            ]
-        else:
-            cmd = [
-                str(FFMPEG_PATH), "-i", video_path_str,
-                "-vf", f"subtitles='{srt_path_str}':force_style='FontName=Microsoft YaHei,FontSize=24,PrimaryColour=&HFFFFFF,OutlineColour=&H000000,BorderStyle=3'",
-                "-c:a", "copy",
-                "-y", out_path_str
-            ]
-
-        try:
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
-            result_msg = f"处理完成！\n输出视频: {out_filename}\n{save_info}"
-        except subprocess.CalledProcessError as e:
-            result_msg = f"字幕嵌入失败: {e.stderr}\n{save_info}"
-
+        # 不再嵌入视频，仅提示字幕保存位置
+        result_msg = f"音频识别完成！字幕文件已生成。\n{save_info}"
         combined_text = f"{result_msg}\n\n【识别文本】\n{full_text}"
+
         progress(0.9, desc="清理...")
         manager.cleanup_temp()
         progress(1.0, desc="完成")
         return combined_text, timestamps_json, srt_text
     except Exception as e:
-        import traceback
-        traceback.print_exc()
+        logging.error(traceback.format_exc())
         error_msg = f"处理视频时发生未知错误: {str(e)}"
         return error_msg, "", ""
     finally:
@@ -1018,6 +1034,7 @@ def transcribe_batch(files, asr_model_type, use_gpu, use_half, enable_vad, enabl
                 saved_files.append(f"{Path(saved['srt']).name}")
             file_list = "\n    ".join(saved_files) if saved_files else "无文件保存"
             results_text.append(f"【{os.path.basename(file_path)}】\n已保存:\n    {file_list}\n")
+    progress(1.0, desc="完成")
     manager.cleanup_temp()
     return "\n".join(results_text), "", ""
 
@@ -1104,6 +1121,7 @@ def force_align_wrapper(audio, text, asr_model_type, use_gpu, use_half,
 
     # 空行断句（精确 token 匹配）
     force_break = None
+    merge_warnings = []
     if merge_by_newline and words and timestamps:
         asr = manager.asr_system.asr
         paragraphs = [p.strip() for p in text.split('\n') if p.strip()]
@@ -1125,7 +1143,22 @@ def force_align_wrapper(audio, text, asr_model_type, use_gpu, use_half,
                         force_break[end_idx] = True
                     current_pos = end_idx + 1
                 else:
-                    print(f"警告：段落 '{para[:30]}...' 无法与词序列匹配，该段落将不按空行断句")
+                    para_clean = re.sub(r'[^\w\u4e00-\u9fff]', '', para)
+                    for start in range(current_pos, len(words) - len(para_tokens) + 1):
+                        segment = ''.join(words[start:start+len(para_tokens)])
+                        segment_clean = re.sub(r'[^\w\u4e00-\u9fff]', '', segment)
+                        if segment_clean == para_clean:
+                            found = start
+                            break
+                    if found >= 0:
+                        end_idx = found + len(para_tokens) - 1
+                        if end_idx < len(words) - 1:
+                            force_break[end_idx] = True
+                        current_pos = end_idx + 1
+                    else:
+                        msg = f"警告：段落 '{para[:30]}...' 无法与词序列匹配，该段落将不按空行断句"
+                        print(msg)
+                        merge_warnings.append(msg)
 
     # 标点断句索引
     force_break_punc = None
@@ -1182,12 +1215,17 @@ def force_align_wrapper(audio, text, asr_model_type, use_gpu, use_half,
         )
         merged_srt = sentences_to_srt(sentences)
         
-        # ---------- 修改：使用统一命名函数生成合并字幕文件名 ----------
         timestamp_str = time.strftime("%Y%m%d_%H%M%S")
         prefix = generate_output_filename(audio, timestamp_str, default_name="align")
         merged_path = ALIGN_OUTPUT_DIR / f"{prefix}_merged_custom.srt"
         with open(merged_path, "w", encoding="utf-8") as f:
             f.write(merged_srt)
+
+    if merge_warnings:
+        try:
+            gr.Warning("\n".join(merge_warnings))
+        except:
+            pass
 
     progress(0.9, desc="清理...")
     manager.cleanup_temp()
@@ -1351,7 +1389,7 @@ def create_interface():
                     outputs=[audio_input, text_output, json_output, srt_output, preview_output]
                 )
 
-            # ---------- 视频字幕 ----------
+            # ---------- 视频字幕（仅提取字幕，不嵌入）----------
             with gr.Tab("视频字幕"):
                 with gr.Row():
                     with gr.Column(scale=1):
@@ -1362,13 +1400,13 @@ def create_interface():
                             interactive=True
                         )
                         subtitle_mode = gr.Radio(
-                            label="字幕嵌入模式",
+                            label="字幕嵌入模式（已失效，仅保留界面）",
                             choices=["soft", "hard"],
                             value="soft",
-                            info="soft: 外挂字幕（可开关）| hard: 永久烧录到画面"
+                            info="功能已关闭，仅生成字幕文件"
                         )
                         with gr.Row():
-                            video_transcribe_btn = gr.Button("开始处理", variant="primary")
+                            video_transcribe_btn = gr.Button("提取字幕", variant="primary")
                             video_clear_btn = gr.Button("清空", variant="secondary")
                     with gr.Column(scale=2):
                         with gr.Tabs():
@@ -1441,7 +1479,6 @@ def create_interface():
                             placeholder="将稿子文本粘贴到这里，确保与音频内容一致...\n用空行分隔段落可实现强制分段。"
                         )
                         
-                        # 合并参数区域（可折叠）
                         with gr.Accordion("字幕合并参数", open=True):
                             merge_punctuations = gr.Textbox(
                                 label="句末标点符号", value="。！？.!?",
@@ -1519,7 +1556,6 @@ def create_interface():
                         output_dir_input = gr.Textbox(label="输出目录", value=str(OUTPUT_DIR), interactive=True, scale=3)
                         update_output_btn = gr.Button("更新输出目录", variant="secondary", scale=1)
                     with gr.Row():
-                        # 字幕预览大小阈值滑块
                         preview_max_size = gr.Slider(
                             label="字幕预览最大文件大小 (MB)", minimum=1, maximum=100, value=manager.settings.get("preview_max_size_mb", 5), step=1,
                             info="超过此大小的音频将不会在预览中加载，避免浏览器卡顿"
@@ -1528,7 +1564,6 @@ def create_interface():
                         open_output_btn = gr.Button("打开输出目录")
                         open_log_btn = gr.Button("打开日志文件夹")
                         clear_cache_btn = gr.Button("清理临时文件")
-                    # 配置保存/加载
                     with gr.Row():
                         save_config_btn = gr.Button("保存当前配置", variant="primary")
                         preset_files = sorted([f.name for f in PRESET_DIR.glob("preset_*.json")], reverse=True)
@@ -1537,7 +1572,6 @@ def create_interface():
                         refresh_preset_btn = gr.Button("刷新列表", variant="secondary", size="sm")
                     config_status = gr.Textbox(label="配置状态", interactive=False)
 
-                # 更新输出目录
                 def update_output_dir(new_dir, new_preview_size):
                     global OUTPUT_DIR, ALIGN_OUTPUT_DIR
                     try:
@@ -1574,7 +1608,6 @@ def create_interface():
                     return f"清理了 {cleaned} 个临时文件"
                 clear_cache_btn.click(clear_cache, outputs=[config_status])
 
-                # 保存当前配置
                 def save_current_config():
                     config = {
                         "asr_model_type": asr_model_type.value,
@@ -1596,7 +1629,6 @@ def create_interface():
                         "vad_speech_threshold": vad_speech_threshold.value,
                         "vad_smooth_window_size": vad_smooth_window_size.value,
                         "punc_threshold": punc_threshold.value,
-                        # 合并参数
                         "merge_punctuations": merge_punctuations.value,
                         "merge_max_words": merge_max_words.value,
                         "merge_max_chars": merge_max_chars.value,
@@ -1614,7 +1646,6 @@ def create_interface():
                     preset_path = PRESET_DIR / f"preset_{timestamp}.json"
                     with open(preset_path, "w", encoding="utf-8") as f:
                         json.dump(config, f, ensure_ascii=False, indent=2)
-                    # 更新下拉列表
                     new_choices = sorted([f.name for f in PRESET_DIR.glob("preset_*.json")], reverse=True)
                     return f"配置已保存到 {preset_path}", gr.update(choices=new_choices)
                 save_config_btn.click(
@@ -1622,22 +1653,20 @@ def create_interface():
                     outputs=[config_status, preset_selector]
                 )
 
-                # 刷新预设列表
                 def refresh_preset_list():
                     new_choices = sorted([f.name for f in PRESET_DIR.glob("preset_*.json")], reverse=True)
                     return gr.update(choices=new_choices)
                 refresh_preset_btn.click(refresh_preset_list, outputs=[preset_selector])
 
-                # 加载所选配置
                 def load_selected_config(filename):
                     if not filename:
-                        return ["请先选择一个预设文件"] + [gr.update() for _ in range(30)]  # 30个更新
+                        return ["请先选择一个预设文件"] + [gr.update() for _ in range(29)]
                     file_path = PRESET_DIR / filename
                     try:
                         with open(file_path, 'r', encoding='utf-8') as f:
                             cfg = json.load(f)
                     except Exception as e:
-                        return [f"加载失败: {e}"] + [gr.update() for _ in range(30)]
+                        return [f"加载失败: {e}"] + [gr.update() for _ in range(29)]
 
                     updates = [
                         gr.update(value=cfg.get("asr_model_type", "aed")),
@@ -1672,7 +1701,6 @@ def create_interface():
                         gr.update(value=cfg.get("merge_by_newline", False)),
                         gr.update(value=cfg.get("preview_max_size_mb", 5)),
                     ]
-                    # 返回列表：第一个是状态信息，后面是30个更新
                     return [f"配置已加载: {filename}"] + updates
 
                 load_config_btn.click(
@@ -1726,14 +1754,15 @@ def main():
     model_root = ROOT_DIR / "pretrained_models"
     if not model_root.exists():
         print(f"警告: 模型目录 {model_root} 不存在，请确保模型已下载。")
-        print("请创建符号链接或将模型文件夹放在正确位置。")
 
     demo = create_interface()
-    demo.queue().launch(
+    demo.queue(default_concurrency_limit=1)
+    demo.launch(
         server_name="127.0.0.1",
         server_port=18006,
         inbrowser=True,
-        show_error=True
+        show_error=True,
+        max_file_size=200 * 1024 * 1024   # 200 MB 上限
     )
 
 if __name__ == "__main__":

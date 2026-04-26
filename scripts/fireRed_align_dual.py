@@ -1,29 +1,16 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-FireRedASR2S 文稿对齐 + 双语字幕生成（独立版）- 最终修复版
-修复内容：
-- 批量处理文件路径错误
-- 批量处理输出绑定冲突
-- 进度条边界保护
-- 标点断句边界优化
-- 日志记录完善
-Copyright 2026 光影的故事2018
+FireRedASR2S 文稿对齐 + 双语字幕生成（锚点增强版 · 完全修复）
+修复列表：
+- anchor_align_segments 缩进错误导致的锚点失效/崩溃
+- current_text 赋值逻辑冗余
+- 时间格式化函数统一
+- 批量处理输出移除无效 gr.State
+- 批量界面提示锚点暂不支持
 """
 
-import sys
-import os
-import re
-import time
-import json
-import gc
-import logging
-import threading
-import atexit
-import tempfile
-import hashlib
-import shutil
-import subprocess
+import sys, os, re, time, json, gc, logging, threading, atexit, tempfile, shutil, subprocess
 from pathlib import Path
 from datetime import timedelta
 from typing import List, Dict, Optional, Tuple, Union
@@ -32,7 +19,6 @@ from typing import List, Dict, Optional, Tuple, Union
 LOG_DIR = Path(__file__).parent.parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 LOG_FILE = LOG_DIR / f"align_{time.strftime('%Y%m%d')}.log"
-
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -48,7 +34,6 @@ CURRENT_DIR = Path(__file__).parent.absolute()
 PROJECT_ROOT = CURRENT_DIR.parent
 sys.path.insert(0, str(PROJECT_ROOT / "FireRedASR2S"))
 
-# 导入 FireRedASR2S 模块
 try:
     from fireredasr2s import FireRedAsr2System, FireRedAsr2SystemConfig
     from fireredasr2s.fireredasr2 import FireRedAsr2Config
@@ -61,7 +46,6 @@ except ImportError as e:
     print("请确保 FireRedASR2S 模块已正确放置在 FireRedASR2S 目录下")
     sys.exit(1)
 
-# 导入 Gradio 和音频处理库
 try:
     import gradio as gr
     import torch
@@ -72,7 +56,6 @@ except ImportError as e:
     logger.error(f"缺少基础依赖库: {e}")
     sys.exit(1)
 
-# ==================== 路径设置 ====================
 BASE_DIR = Path(__file__).parent.absolute()
 ROOT_DIR = BASE_DIR.parent
 OUTPUT_DIR = ROOT_DIR / "output" / "字幕自动打轴"
@@ -84,7 +67,6 @@ if sys.platform == "win32":
     PORTABLE_FFMPEG_EXE = PORTABLE_FFMPEG_DIR / "ffmpeg.exe"
 else:
     PORTABLE_FFMPEG_EXE = PORTABLE_FFMPEG_DIR / "ffmpeg"
-
 if PORTABLE_FFMPEG_EXE.exists():
     os.environ["PATH"] = str(PORTABLE_FFMPEG_DIR) + os.pathsep + os.environ.get("PATH", "")
     FFMPEG_PATH = str(PORTABLE_FFMPEG_EXE)
@@ -98,17 +80,39 @@ else:
         FFMPEG_PATH = "ffmpeg"
         logger.warning("未找到 FFmpeg，视频处理功能不可用")
 
-# ==================== 模型管理器（线程安全） ====================
+# ==================== 时间格式化统一实现 ====================
+def seconds_to_srt_time(seconds: float) -> str:
+    if seconds < 0:
+        seconds = 0
+    td = timedelta(seconds=seconds)
+    total_seconds = int(td.total_seconds())
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    secs = total_seconds % 60
+    ms = int((td.total_seconds() - total_seconds) * 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
+
+def sentences_to_srt(sentences: List[Dict]) -> str:
+    lines = []
+    for i, sent in enumerate(sentences, 1):
+        flag = sent.get("flag", "")
+        seq = f"{i}{flag}" if flag else str(i)
+        lines.append(seq)
+        lines.append(f"{seconds_to_srt_time(sent['start'])} --> {seconds_to_srt_time(sent['end'])}")
+        lines.append(sent["text"])
+        lines.append("")
+    return "\n".join(lines)
+
+# ==================== 模型管理器 ====================
 class FireRedAlignManager:
     def __init__(self):
         self.asr_system = None
         self.config = None
         self.lock = threading.RLock()
         self.temp_files = []
-        self.model_dir = None  # 实际使用的模型目录
+        self.model_dir = None
 
     def find_model_dir(self, preferred_type="AED"):
-        """自动查找模型目录，支持 AED 或 AED-2025 等变体"""
         candidates = [
             ROOT_DIR / "pretrained_models" / f"FireRedASR2-{preferred_type}",
             ROOT_DIR / "pretrained_models" / f"FireRedASR2-{preferred_type}-2025",
@@ -195,7 +199,6 @@ class FireRedAlignManager:
             return True, "系统已卸载"
 
     def _prepare_audio(self, audio_input):
-        # 安全处理音频路径
         if isinstance(audio_input, str):
             audio_path = audio_input
         elif isinstance(audio_input, tuple) and len(audio_input) > 0:
@@ -208,18 +211,32 @@ class FireRedAlignManager:
             logger.error(f"音频文件不存在: {audio_path}")
             return None
 
+        with tempfile.NamedTemporaryFile(delete=False, suffix="_16k_mono.wav") as tmp_file:
+            tmp_path = tmp_file.name
+        cmd = [
+            FFMPEG_PATH, "-y", "-i", audio_path,
+            "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", tmp_path
+        ]
         try:
-            data, sr = librosa.load(audio_path, sr=None)
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except subprocess.CalledProcessError as e:
+            logger.error(f"FFmpeg 预处理失败: {e.stderr.decode()[:200]}")
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            return None
+
+        try:
+            data, sr = sf.read(tmp_path, dtype='float32')
             if sr != 16000:
-                data = librosa.resample(data.astype(np.float32), orig_sr=sr, target_sr=16000)
+                logger.warning(f"音频采样率异常 {sr}，尝试强制重采样")
+                data = librosa.resample(data, orig_sr=sr, target_sr=16000)
                 sr = 16000
-            temp_hash = hashlib.md5(data.tobytes() + str(time.time()).encode()).hexdigest()[:8]
-            temp_path = os.path.join(tempfile.gettempdir(), f"firered_align_{temp_hash}.wav")
-            sf.write(temp_path, data, sr)
-            self.temp_files.append(temp_path)
-            return temp_path
+            self.temp_files.append(tmp_path)
+            return audio_path, data, sr
         except Exception as e:
-            logger.error(f"音频处理失败: {e}", exc_info=True)
+            logger.error(f"音频读取失败: {e}", exc_info=True)
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
             return None
 
     def cleanup_temp(self):
@@ -238,17 +255,17 @@ class FireRedAlignManager:
         if self.asr_system is None:
             return None, None, None, None, "模型未加载"
 
-        audio_path = self._prepare_audio(audio_input)
-        if audio_path is None:
+        audio_prepare_result = self._prepare_audio(audio_input)
+        if audio_prepare_result is None:
             return None, None, None, None, "音频处理失败"
 
-        try:
-            waveform, sr = librosa.load(audio_path, sr=16000, mono=True)
-            duration = len(waveform) / 16000
+        audio_path, waveform, sr = audio_prepare_result
+        duration = len(waveform) / sr
 
+        try:
             asr = self.asr_system.asr
 
-            feats, lengths, durs, _, _ = asr.feat_extractor([(16000, waveform)], ["tmp"])
+            feats, lengths, _, _, _ = asr.feat_extractor([(16000, waveform)], ["tmp"])
             if not isinstance(lengths, torch.Tensor):
                 lengths = torch.tensor(lengths, dtype=torch.long)
             else:
@@ -284,20 +301,13 @@ class FireRedAlignManager:
             if len(starts) == 0:
                 return None, None, None, None, "时间戳为空"
 
-            # 时间戳单位检测
             max_start = max(starts)
-            if max_start <= duration * 1.5 and max_start > 0.01 * duration:
+            if max_start <= T and min(starts) >= 0:
+                timestamps_sec = [(s * frame_shift, e * frame_shift) for s, e in zip(starts, ends)]
+            elif max_start < duration * 1.5:
                 timestamps_sec = list(zip(starts, ends))
             else:
-                hypothetical_max_sec = max_start * frame_shift
-                if abs(hypothetical_max_sec - duration) < 0.2 * duration:
-                    timestamps_sec = [(s * frame_shift, e * frame_shift) for s, e in zip(starts, ends)]
-                else:
-                    if max_start > duration * 1000:
-                        scale = duration / max_start * 0.95
-                        timestamps_sec = [(s * scale, e * scale) for s, e in zip(starts, ends)]
-                    else:
-                        timestamps_sec = [(s * frame_shift, e * frame_shift) for s, e in zip(starts, ends)]
+                timestamps_sec = [(s / 1000, e / 1000) for s, e in zip(starts, ends)]
 
             min_len = min(len(timestamps_sec), len(token_ids))
             timestamps_sec = timestamps_sec[:min_len]
@@ -309,7 +319,7 @@ class FireRedAlignManager:
             word_srt_lines = []
             for i, ((start, end), txt) in enumerate(zip(timestamps_sec, token_texts), 1):
                 word_srt_lines.append(str(i))
-                word_srt_lines.append(f"{self._seconds_to_srt_time(start)} --> {self._seconds_to_srt_time(end)}")
+                word_srt_lines.append(f"{seconds_to_srt_time(start)} --> {seconds_to_srt_time(end)}")
                 word_srt_lines.append(txt)
                 word_srt_lines.append("")
             word_srt = "\n".join(word_srt_lines)
@@ -318,61 +328,29 @@ class FireRedAlignManager:
                 start_all = timestamps_sec[0][0]
                 end_all = timestamps_sec[-1][1]
                 full_text = asr.tokenizer.detokenize(token_ids)
-                sentence_srt = f"1\n{self._seconds_to_srt_time(start_all)} --> {self._seconds_to_srt_time(end_all)}\n{full_text}\n"
+                sentence_srt = f"1\n{seconds_to_srt_time(start_all)} --> {seconds_to_srt_time(end_all)}\n{full_text}\n"
             else:
                 sentence_srt = ""
+
+            del feats, enc_outputs, enc_lengths, yseq
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             return word_srt, sentence_srt, timestamps_sec, token_texts, None
 
         except Exception as e:
             logger.error(f"强制对齐失败: {e}", exc_info=True)
             return None, None, None, None, f"强制对齐失败: {str(e)}"
-        finally:
-            if audio_path in self.temp_files:
-                self.temp_files.remove(audio_path)
-                try:
-                    os.unlink(audio_path)
-                except:
-                    pass
-
-    def _seconds_to_srt_time(self, seconds):
-        td = timedelta(seconds=seconds)
-        total_seconds = int(td.total_seconds())
-        hours = total_seconds // 3600
-        minutes = (total_seconds % 3600) // 60
-        secs = total_seconds % 60
-        ms = int((td.total_seconds() - total_seconds) * 1000)
-        return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
 
 manager = FireRedAlignManager()
 
-# ==================== 工具函数 ====================
-def seconds_to_srt_time(seconds: float) -> str:
-    hours = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    secs = int(seconds % 60)
-    millis = int((seconds - int(seconds)) * 1000)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
-
-def sentences_to_srt(sentences: List[Dict]) -> str:
-    lines = []
-    for i, sent in enumerate(sentences, 1):
-        lines.append(str(i))
-        lines.append(f"{seconds_to_srt_time(sent['start'])} --> {seconds_to_srt_time(sent['end'])}")
-        lines.append(sent["text"])
-        lines.append("")
-    return "\n".join(lines)
-
 def merge_timestamps_to_sentences(timestamps, words,
                                    sentence_endings="。！？.!?",
-                                   max_words=20,
-                                   max_chars=50,
-                                   max_duration=10.0,
+                                   max_words=20, max_chars=50, max_duration=10.0,
                                    silence_threshold=0.3,
-                                   merge_by_punc=True,
-                                   merge_by_silence=True,
-                                   merge_by_wordcount=True,
-                                   merge_by_charcount=True,
+                                   merge_by_punc=True, merge_by_silence=True,
+                                   merge_by_wordcount=True, merge_by_charcount=True,
                                    merge_by_duration=True,
                                    force_break_indices=None):
     if len(timestamps) == 0:
@@ -386,7 +364,6 @@ def merge_timestamps_to_sentences(timestamps, words,
 
     for i, ((start, end), word) in enumerate(zip(timestamps, words)):
         should_break = False
-
         if force_break_indices and i < len(force_break_indices) and force_break_indices[i]:
             should_break = True
         else:
@@ -399,18 +376,16 @@ def merge_timestamps_to_sentences(timestamps, words,
             if not should_break and merge_by_wordcount and len(current_words) + 1 >= max_words:
                 should_break = True
             if not should_break and merge_by_charcount and current_words:
-                new_text = current_text + word
-                if len(new_text) >= max_chars:
+                if len(current_text + word) >= max_chars:
                     should_break = True
             if not should_break and merge_by_duration and current_words:
-                current_duration = last_end - current_start
-                if current_duration + (end - start) >= max_duration:
+                if (last_end - current_start) + (end - start) >= max_duration:
                     should_break = True
 
         if not current_words:
             current_start = start
         current_words.append(word)
-        current_text = (current_text + word) if current_words else word
+        current_text += word   # 修复冗余三元表达式
         last_end = end
 
         if should_break:
@@ -430,6 +405,78 @@ def merge_timestamps_to_sentences(timestamps, words,
             "text": "".join(current_words).strip()
         })
     return sentences
+
+def clean_text_for_anchor(text: str, extra_patterns: str = "") -> str:
+    text = re.sub(r'[\u200b\u200c\u200d\ufeff\u2060]', '', text)
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = re.sub(r'\n{3,}', '\n', text)
+
+    if extra_patterns and extra_patterns.strip():
+        for line in extra_patterns.strip().splitlines():
+            pattern = line.strip()
+            if not pattern:
+                continue
+            try:
+                compiled = re.compile(pattern)
+                text = compiled.sub('', text)
+                logger.info(f"[锚点清洗] 成功应用正则: {pattern}")
+            except re.error as e:
+                logger.warning(f"[锚点清洗] 跳过无效正则 '{pattern}': {e}")
+    return text.strip()
+
+def anchor_align_segments(words, word_timestamps, force_break_indices, audio_duration,
+                          anchor_char_count=3, merge_warnings=None):
+    if not words or not word_timestamps:
+        return []
+    segments = []
+    cur_words, cur_ts = [], []
+    for i, (word, (s, e)) in enumerate(zip(words, word_timestamps)):
+        cur_words.append(word)
+        cur_ts.append((s, e))
+        if force_break_indices[i]:
+            segments.append((cur_words, cur_ts))
+            cur_words, cur_ts = [], []
+    if cur_words:
+        segments.append((cur_words, cur_ts))
+
+    result_sentences = []
+    for idx, (seg_words, seg_ts) in enumerate(segments):
+        seg_text = "".join(seg_words).strip()
+        if not seg_text:
+            continue
+        chinese_indices = [i for i, w in enumerate(seg_words) if re.search(r'[\u4e00-\u9fff]', w)]
+        confidence_flag = ""
+        if chinese_indices:
+            if len(chinese_indices) < anchor_char_count:
+                confidence_flag = "[!] 首部汉字不足"
+                if merge_warnings is not None:
+                    merge_warnings.append(f"第{idx+1}段：首部汉字不足（仅{len(chinese_indices)}个），锚点可能偏移")
+                seg_start = seg_ts[chinese_indices[0]][0]
+            else:
+                seg_start = seg_ts[0][0]   # 汉字足够，仍用第一个词开始
+        else:
+            confidence_flag = "[!] 无汉字"
+            if merge_warnings is not None:
+                merge_warnings.append(f"第{idx+1}段：没有汉字，锚点失效")
+            seg_start = seg_ts[0][0]
+
+        seg_end = seg_ts[-1][1]
+        if idx < len(segments) - 1:
+            next_start = segments[idx+1][1][0][0]
+            if seg_end > next_start:
+                seg_end = next_start
+        else:
+            seg_end = min(seg_end, audio_duration)
+        if seg_end <= seg_start:
+            seg_end = seg_start + 0.01
+
+        result_sentences.append({
+            "start": seg_start,
+            "end": seg_end,
+            "text": seg_text,
+            "flag": confidence_flag
+        })
+    return result_sentences
 
 def get_system_status():
     lines = []
@@ -459,49 +506,53 @@ def safe_audio_path(audio_input) -> Optional[str]:
         return os.path.abspath(audio_input.get("name")) if audio_input.get("name") else None
     return None
 
-# ==================== 单次对齐处理 ====================
 def run_alignment(
     audio_file, primary_text, secondary_text, secondary_lang, enable_dual,
     use_gpu, use_half, model_dir_override,
     merge_punctuations, merge_max_words, merge_max_chars, merge_max_duration,
     merge_silence_threshold, merge_by_punc, merge_by_silence, merge_by_wordcount,
     merge_by_charcount, merge_by_duration, merge_by_newline,
-    progress=gr.Progress()
+    use_anchor, anchor_char_count, extra_regex="", progress=gr.Progress()
 ):
     if audio_file is None:
-        return "错误: 请上传音频文件", "", "", "", "", "", get_system_status()
+        return "错误: 请上传音频文件", "", "", "", "", "", "", get_system_status()
     if not primary_text or not primary_text.strip():
-        return "错误: 请粘贴主文稿", "", "", "", "", "", get_system_status()
+        return "错误: 请粘贴主文稿", "", "", "", "", "", "", get_system_status()
+
+    if use_anchor:
+        primary_text_cleaned = clean_text_for_anchor(primary_text, extra_regex)
+    else:
+        primary_text_cleaned = primary_text
 
     audio_path = safe_audio_path(audio_file)
     if not audio_path or not os.path.exists(audio_path):
-        return "错误: 无法获取有效的音频文件路径", "", "", "", "", "", get_system_status()
+        return "错误: 无法获取有效的音频文件路径", "", "", "", "", "", "", get_system_status()
 
     progress(0.05, desc="加载模型...")
     success, msg = manager.load_system(use_gpu, use_half, model_dir_override)
     if not success:
-        return f"错误: {msg}", "", "", "", "", "", get_system_status()
+        return f"错误: {msg}", "", "", "", "", "", "", get_system_status()
 
     progress(0.2, desc="强制对齐中...")
-    word_srt, sent_srt, timestamps, words, error = manager.force_align(audio_path, primary_text)
+    word_srt, sent_srt, timestamps, words, error = manager.force_align(audio_path, primary_text_cleaned)
     if error:
-        return f"错误: {error}", "", "", "", "", "", get_system_status()
+        return f"错误: {error}", "", "", "", "", "", "", get_system_status()
 
     if not timestamps or not words:
-        return "错误: 未获取到有效时间戳", "", "", "", "", "", get_system_status()
+        return "错误: 未获取到有效时间戳", "", "", "", "", "", "", get_system_status()
 
     asr = manager.asr_system.asr
     force_break = None
     merge_warnings = []
 
     progress(0.4, desc="处理空行断句...")
-    # === 精确空行断句 ===
     if merge_by_newline and words and timestamps:
-        paragraphs = [p.strip() for p in primary_text.split('\n') if p.strip()]
+        paragraphs = [p.strip() for p in primary_text_cleaned.split('\n') if p.strip()]
         if len(paragraphs) > 1:
             force_break = [False] * len(words)
             current_pos = 0
             total_words = len(words)
+            words_clean = [re.sub(r'[^\w\u4e00-\u9fff]', '', w) for w in words]
             for para in paragraphs:
                 para_tokens, _ = asr.tokenizer.tokenize(para)
                 if len(para_tokens) == 0:
@@ -511,43 +562,35 @@ def run_alignment(
                     if words[start:start+len(para_tokens)] == para_tokens:
                         found = start
                         break
+                if found < 0:
+                    para_clean = re.sub(r'[^\w\u4e00-\u9fff]', '', para)
+                    for start in range(current_pos, total_words - len(para_tokens) + 1):
+                        segment_clean = ''.join(words_clean[start:start+len(para_tokens)])
+                        if segment_clean == para_clean:
+                            found = start
+                            break
                 if found >= 0:
                     end_idx = found + len(para_tokens) - 1
                     if end_idx < total_words - 1:
                         force_break[end_idx] = True
                     current_pos = end_idx + 1
                 else:
-                    para_clean = re.sub(r'[^\w\u4e00-\u9fff]', '', para)
-                    for start in range(current_pos, total_words - len(para_tokens) + 1):
-                        segment = ''.join(words[start:start+len(para_tokens)])
-                        segment_clean = re.sub(r'[^\w\u4e00-\u9fff]', '', segment)
-                        if segment_clean == para_clean:
-                            found = start
-                            break
-                    if found >= 0:
-                        end_idx = found + len(para_tokens) - 1
-                        if end_idx < total_words - 1:
-                            force_break[end_idx] = True
-                        current_pos = end_idx + 1
-                    else:
-                        msg = f"警告：段落 '{para[:30]}...' 无法与词序列匹配"
-                        merge_warnings.append(msg)
-                # 进度保护
+                    msg = f"警告：段落 '{para[:30]}...' 无法与词序列匹配，已保留原分段"
+                    merge_warnings.append(msg)
                 progress(0.4 + 0.1 * min(current_pos / total_words, 1.0), desc="处理空行断句...")
 
     progress(0.55, desc="处理标点断句...")
-    # === 精确标点断句 ===
     force_break_punc = None
     if merge_by_punc and words and timestamps:
-        punc_positions = [idx for idx, ch in enumerate(primary_text) if ch in merge_punctuations]
+        punc_positions = [idx for idx, ch in enumerate(primary_text_cleaned) if ch in merge_punctuations]
         if punc_positions:
-            tokens_all, _ = asr.tokenizer.tokenize(primary_text)
-            char_to_token = [-1] * len(primary_text)
+            tokens_all, _ = asr.tokenizer.tokenize(primary_text_cleaned)
+            char_to_token = [-1] * len(primary_text_cleaned)
             cur = 0
             for token_idx, token in enumerate(tokens_all):
                 token_len = len(token)
                 for i in range(token_len):
-                    if cur + i < len(primary_text):
+                    if cur + i < len(primary_text_cleaned):
                         char_to_token[cur + i] = token_idx
                 cur += token_len
             force_break_punc = [False] * len(words)
@@ -557,7 +600,6 @@ def run_alignment(
                     if 0 <= tidx < len(words):
                         force_break_punc[tidx] = True
 
-    # 合并断句索引
     final_force_break = None
     if force_break is not None or force_break_punc is not None:
         final_force_break = [False] * len(words)
@@ -574,9 +616,7 @@ def run_alignment(
     sentences = merge_timestamps_to_sentences(
         timestamps, words,
         sentence_endings=merge_punctuations,
-        max_words=merge_max_words,
-        max_chars=merge_max_chars,
-        max_duration=merge_max_duration,
+        max_words=merge_max_words, max_chars=merge_max_chars, max_duration=merge_max_duration,
         silence_threshold=merge_silence_threshold,
         merge_by_punc=False,
         merge_by_silence=merge_by_silence,
@@ -587,7 +627,18 @@ def run_alignment(
     )
     merged_srt = sentences_to_srt(sentences)
 
-    # 双语挂载
+    anchor_srt = ""
+    if use_anchor and final_force_break and words and timestamps:
+        audio_duration = timestamps[-1][1] + 0.5 if timestamps else 0.0
+        anchor_warnings = []
+        anchor_sentences = anchor_align_segments(
+            words, timestamps, final_force_break, audio_duration,
+            anchor_char_count=anchor_char_count, merge_warnings=anchor_warnings
+        )
+        anchor_srt = sentences_to_srt(anchor_sentences)
+        if anchor_warnings:
+            merge_warnings.extend(anchor_warnings)
+
     dual_srt = ""
     secondary_srt_str = ""
     warning_msg = ""
@@ -623,11 +674,9 @@ def run_alignment(
         else:
             warning_msg = f"⚠️ 段落数相差 {len_diff} 段（超过1），跳过双语生成"
 
-    # 合并警告信息
     if merge_warnings:
         warning_msg = warning_msg + "\n" + "\n".join(merge_warnings) if warning_msg else "\n".join(merge_warnings)
 
-    # 保存文件
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     base_name = Path(audio_path).stem if audio_path else "align"
     prefix = f"{base_name}_align_{timestamp}"
@@ -635,30 +684,28 @@ def run_alignment(
     word_path = OUTPUT_DIR / f"{prefix}_words.srt"
     sent_path = OUTPUT_DIR / f"{prefix}_sentence.srt"
     merged_path = OUTPUT_DIR / f"{prefix}_merged.srt"
-
-    with open(word_path, "w", encoding="utf-8") as f:
-        f.write(word_srt)
-    with open(sent_path, "w", encoding="utf-8") as f:
-        f.write(sent_srt)
-    with open(merged_path, "w", encoding="utf-8") as f:
-        f.write(merged_srt)
+    with open(word_path, "w", encoding="utf-8") as f: f.write(word_srt)
+    with open(sent_path, "w", encoding="utf-8") as f: f.write(sent_srt)
+    with open(merged_path, "w", encoding="utf-8") as f: f.write(merged_srt)
 
     status = f"✅ 对齐完成！\n逐词字幕: {word_path.name}\n整句字幕: {sent_path.name}\n合并字幕: {merged_path.name}"
 
-    # 过滤语言标记（只允许字母数字下划线横线）
+    if anchor_srt:
+        anchor_path = OUTPUT_DIR / f"{prefix}_anchor.srt"
+        with open(anchor_path, "w", encoding="utf-8") as f: f.write(anchor_srt)
+        status += f"\n锚点字幕: {anchor_path.name}"
+
     safe_lang_tag = re.sub(r'[^\w\-]', '', secondary_lang.strip()) if secondary_lang else ""
     safe_lang_tag = f"_{safe_lang_tag}" if safe_lang_tag else ""
 
     if secondary_srt_str:
         sec_path = OUTPUT_DIR / f"{prefix}{safe_lang_tag}_secondary.srt"
-        with open(sec_path, "w", encoding="utf-8") as f:
-            f.write(secondary_srt_str)
+        with open(sec_path, "w", encoding="utf-8") as f: f.write(secondary_srt_str)
         status += f"\n副文稿单语: {sec_path.name}"
 
     if dual_srt:
         dual_path = OUTPUT_DIR / f"{prefix}{safe_lang_tag}_dual.srt"
-        with open(dual_path, "w", encoding="utf-8") as f:
-            f.write(dual_srt)
+        with open(dual_path, "w", encoding="utf-8") as f: f.write(dual_srt)
         status += f"\n双语字幕: {dual_path.name}"
 
     if warning_msg:
@@ -667,12 +714,11 @@ def run_alignment(
 
     manager.cleanup_temp()
     progress(1.0, desc="完成")
-    return status, word_srt, sent_srt, merged_srt, secondary_srt_str, dual_srt, get_system_status()
+    return status, word_srt, sent_srt, merged_srt, secondary_srt_str, dual_srt, anchor_srt, get_system_status()
 
 def clear_outputs():
-    return "等待开始", "", "", "", "", "", get_system_status()
+    return "等待开始", "", "", "", "", "", "", get_system_status()
 
-# ==================== 批量处理 ====================
 def batch_process(
     audio_files, text_files, enable_dual_batch,
     use_gpu, use_half, model_dir_override,
@@ -682,27 +728,24 @@ def batch_process(
     progress=gr.Progress()
 ):
     if not audio_files or not text_files:
-        return "请上传音频文件和对应的文稿文件（数量相同，顺序对应）", "", get_system_status()
+        return "请上传音频文件和对应的文稿文件（数量相同，顺序对应）", get_system_status()
     if len(audio_files) != len(text_files):
-        return f"音频文件数量 ({len(audio_files)}) 与文稿文件数量 ({len(text_files)}) 不一致，请检查", "", get_system_status()
+        return f"音频文件数量 ({len(audio_files)}) 与文稿文件数量 ({len(text_files)}) 不一致", get_system_status()
 
-    # 加载模型（复用，只需一次）
     progress(0.02, desc="加载模型...")
     success, msg = manager.load_system(use_gpu, use_half, model_dir_override)
     if not success:
-        return f"模型加载失败: {msg}", "", get_system_status()
+        return f"模型加载失败: {msg}", get_system_status()
 
     results = []
     total = len(audio_files)
     for idx, (audio_obj, text_obj) in enumerate(zip(audio_files, text_files)):
         progress(idx / total, desc=f"处理 {idx+1}/{total}...")
-        # 修复：audio_obj 和 text_obj 直接是路径字符串
         audio_path = safe_audio_path(audio_obj)
         if not audio_path or not os.path.exists(audio_path):
             results.append(f"❌ {os.path.basename(audio_obj) if isinstance(audio_obj, str) else '未知'}: 音频文件无效")
             continue
 
-        # 读取文稿内容
         try:
             text_path = text_obj if isinstance(text_obj, str) else (text_obj.name if hasattr(text_obj, 'name') else str(text_obj))
             primary_text = Path(text_path).read_text(encoding='utf-8')
@@ -713,17 +756,14 @@ def batch_process(
             results.append(f"❌ {os.path.basename(audio_path)}: 读取文稿失败 - {e}")
             continue
 
-        # 执行对齐
         word_srt, sent_srt, timestamps, words, error = manager.force_align(audio_path, primary_text)
         if error:
             results.append(f"❌ {os.path.basename(audio_path)}: 对齐失败 - {error}")
             continue
-
         if not timestamps or not words:
             results.append(f"❌ {os.path.basename(audio_path)}: 未获取到有效时间戳")
             continue
 
-        # 断句处理
         asr = manager.asr_system.asr
         force_break = None
         if merge_by_newline and words:
@@ -731,17 +771,27 @@ def batch_process(
             if len(paragraphs) > 1:
                 force_break = [False] * len(words)
                 current_pos = 0
+                words_clean = [re.sub(r'[^\w\u4e00-\u9fff]', '', w) for w in words]
                 for para in paragraphs:
                     para_tokens, _ = asr.tokenizer.tokenize(para)
                     if len(para_tokens) == 0:
                         continue
+                    found = -1
                     for start in range(current_pos, len(words) - len(para_tokens) + 1):
                         if words[start:start+len(para_tokens)] == para_tokens:
-                            end_idx = start + len(para_tokens) - 1
-                            if end_idx < len(words) - 1:
-                                force_break[end_idx] = True
-                            current_pos = end_idx + 1
+                            found = start
                             break
+                    if found < 0:
+                        para_clean = re.sub(r'[^\w\u4e00-\u9fff]', '', para)
+                        for start in range(current_pos, len(words) - len(para_tokens) + 1):
+                            if ''.join(words_clean[start:start+len(para_tokens)]) == para_clean:
+                                found = start
+                                break
+                    if found >= 0:
+                        end_idx = found + len(para_tokens) - 1
+                        if end_idx < len(words) - 1:
+                            force_break[end_idx] = True
+                        current_pos = end_idx + 1
 
         force_break_punc = None
         if merge_by_punc and words:
@@ -763,24 +813,18 @@ def batch_process(
                         if 0 <= tidx < len(words):
                             force_break_punc[tidx] = True
 
-        final_force_break = None
-        if force_break is not None or force_break_punc is not None:
-            final_force_break = [False] * len(words)
-            if force_break:
-                for i, v in enumerate(force_break):
-                    if v:
-                        final_force_break[i] = True
-            if force_break_punc:
-                for i, v in enumerate(force_break_punc):
-                    if v:
-                        final_force_break[i] = True
+        final_force_break = [False] * len(words)
+        if force_break:
+            for i, v in enumerate(force_break):
+                if v: final_force_break[i] = True
+        if force_break_punc:
+            for i, v in enumerate(force_break_punc):
+                if v: final_force_break[i] = True
 
         sentences = merge_timestamps_to_sentences(
             timestamps, words,
             sentence_endings=merge_punctuations,
-            max_words=merge_max_words,
-            max_chars=merge_max_chars,
-            max_duration=merge_max_duration,
+            max_words=merge_max_words, max_chars=merge_max_chars, max_duration=merge_max_duration,
             silence_threshold=merge_silence_threshold,
             merge_by_punc=False,
             merge_by_silence=merge_by_silence,
@@ -791,62 +835,50 @@ def batch_process(
         )
         merged_srt = sentences_to_srt(sentences)
 
-        # 保存文件
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         base_name = Path(audio_path).stem
         prefix = f"{base_name}_align_{timestamp}"
-
         word_path = OUTPUT_DIR / f"{prefix}_words.srt"
         sent_path = OUTPUT_DIR / f"{prefix}_sentence.srt"
         merged_path = OUTPUT_DIR / f"{prefix}_merged.srt"
-
-        with open(word_path, "w", encoding="utf-8") as f:
-            f.write(words_to_srt_from_tokens(words, timestamps))
-        with open(sent_path, "w", encoding="utf-8") as f:
-            f.write(sentences_to_srt(sentences))
-        with open(merged_path, "w", encoding="utf-8") as f:
-            f.write(merged_srt)
-
+        with open(word_path, "w", encoding="utf-8") as f: f.write(word_srt)
+        with open(sent_path, "w", encoding="utf-8") as f: f.write(sent_srt)
+        with open(merged_path, "w", encoding="utf-8") as f: f.write(merged_srt)
         results.append(f"✅ {os.path.basename(audio_path)}: 已生成")
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     manager.cleanup_temp()
     progress(1.0, desc="完成")
-    # 返回结果字符串、空占位、系统状态
-    return "\n".join(results), "", get_system_status()
+    return "\n".join(results), get_system_status()
 
-def words_to_srt_from_tokens(words, timestamps):
-    """辅助函数：从 words 和 timestamps 生成逐词 SRT"""
-    lines = []
-    for i, (word, (start, end)) in enumerate(zip(words, timestamps), 1):
-        lines.append(str(i))
-        lines.append(f"{seconds_to_srt_time(start)} --> {seconds_to_srt_time(end)}")
-        lines.append(word)
-        lines.append("")
-    return "\n".join(lines)
-
-# ==================== 创建界面 ====================
 def create_ui():
-    with gr.Blocks(title="FireRedASR2S 文稿对齐 + 双语字幕生成", theme=gr.themes.Default()) as demo:
-        gr.Markdown("# 🎬 FireRedASR2S 文稿对齐 + 双语字幕生成（正式版）")
+    help_file = Path(__file__).parent / "help_content.json"
+    help_data = {}
+    if help_file.exists():
+        try:
+            with open(help_file, 'r', encoding='utf-8') as f:
+                help_data = json.load(f)
+        except Exception as e:
+            logger.warning(f"加载帮助文件失败: {e}")
+
+    with gr.Blocks(title="FireRedASR2S 文稿对齐 + 双语字幕生成（锚点增强）", theme=gr.themes.Default()) as demo:
+        gr.Markdown("# 🎬 FireRedASR2S 文稿对齐 + 双语字幕生成（锚点增强版）")
 
         with gr.Tabs():
-            # ---------- 单次处理标签页 ----------
             with gr.Tab("单次处理"):
                 with gr.Row():
                     with gr.Column(scale=1):
-                        audio_input = gr.Audio(label="选择音频文件", type="filepath", sources=["upload"])
-                        primary_text = gr.Textbox(
-                            label="主文稿（对齐用）",
-                            lines=18,
-                            placeholder="粘贴与音频内容一致的稿子...\n段落之间用空行分隔"
-                        )
-                        secondary_text = gr.Textbox(
-                            label="副文稿（挂载用，可选）",
-                            lines=18,
-                            placeholder="粘贴翻译稿...\n段落结构尽量与主文稿一致"
-                        )
+                        enable_preview = gr.Checkbox(label="启用音频预览（内置播放器）", value=False)
+                        audio_preview = gr.Audio(label="选择音频文件", type="filepath", sources=["upload"], visible=True)
+                        audio_file_only = gr.File(label="选择音频文件", file_types=[".wav",".mp3",".m4a",".flac",".ogg"], visible=False)
+
+                        primary_text = gr.Textbox(label="主文稿（对齐用）", lines=18, placeholder="粘贴与音频内容一致的稿子...\n段落之间用空行分隔")
+                        secondary_text = gr.Textbox(label="副文稿（挂载用，可选）", lines=18, placeholder="粘贴翻译稿...\n段落结构尽量与主文稿一致")
                         with gr.Row():
-                            secondary_lang = gr.Textbox(label="副文稿语言标记", placeholder="如：en / ja / fr", value="", scale=1)
+                            secondary_lang = gr.Textbox(label="副文稿语言标记", placeholder="en", value="", scale=1)
                             enable_dual = gr.Checkbox(label="生成双语字幕", value=False, scale=1)
 
                     with gr.Column(scale=2):
@@ -858,7 +890,7 @@ def create_ui():
                             with gr.Row():
                                 use_gpu = gr.Checkbox(label="使用 GPU", value=torch.cuda.is_available())
                                 use_half = gr.Checkbox(label="使用半精度 (FP16)", value=False)
-                            model_dir_override = gr.Textbox(label="模型目录（可选）", placeholder="留空自动检测，或指定完整路径", value="")
+                            model_dir_override = gr.Textbox(label="模型目录（可选）", placeholder="留空自动检测")
 
                         with gr.Accordion("📝 字幕合并规则", open=True):
                             with gr.Row():
@@ -876,6 +908,14 @@ def create_ui():
                                 max_words_slider = gr.Slider(label="最大词数", minimum=5, maximum=50, value=20, step=1)
                                 max_chars_slider = gr.Slider(label="最大字符数", minimum=5, maximum=100, value=30, step=5)
                                 max_duration_slider = gr.Slider(label="最大时长 (秒)", minimum=1.0, maximum=20.0, value=10.0, step=0.5)
+                            with gr.Row():
+                                merge_anchor = gr.Checkbox(label="启用锚点增强（以空行为主，前几字定位）", value=False)
+                                anchor_char_count = gr.Slider(1, 10, value=3, step=1, label="锚点参考汉字数")
+                            extra_regex_box = gr.Textbox(
+                                label="📝 自定义过滤规则（锚点清洗专用，每行一个正则）",
+                                placeholder="例如：[A-Za-z]+\n或：\\d+\\.\\d+\n留空则仅默认清洗零宽字符与多余空白",
+                                value="", lines=2, visible=False
+                            )
 
                         with gr.Row():
                             run_btn = gr.Button("开始对齐", variant="primary", size="lg")
@@ -888,76 +928,82 @@ def create_ui():
                                 sent_output = gr.Textbox(label="整句字幕", lines=20, show_copy_button=True)
                             with gr.Tab("合并字幕"):
                                 merged_output = gr.Textbox(label="合并后的字幕", lines=20, show_copy_button=True)
+                            with gr.Tab("锚点增强字幕"):
+                                anchor_output = gr.Textbox(label="锚点增强字幕（可能含置信度标记）", lines=20, show_copy_button=True)
                             with gr.Tab("副文稿单语 SRT"):
                                 secondary_output = gr.Textbox(label="副文稿字幕", lines=20, show_copy_button=True)
                             with gr.Tab("双语 SRT"):
                                 dual_output = gr.Textbox(label="双语字幕", lines=20, show_copy_button=True)
 
-            # ---------- 批量处理标签页 ----------
             with gr.Tab("批量处理"):
                 with gr.Row():
                     with gr.Column(scale=1):
-                        audio_files = gr.File(label="上传音频文件（可多选）", file_count="multiple", file_types=[".wav", ".mp3", ".m4a", ".flac", ".ogg"])
+                        gr.Markdown("*注：批量处理暂不支持锚点增强及自定义正则*")
+                        audio_files = gr.File(label="上传音频文件（可多选）", file_count="multiple", file_types=[".wav",".mp3",".m4a",".flac",".ogg"])
                         text_files = gr.File(label="上传对应的文稿文件（顺序对应）", file_count="multiple", file_types=[".txt"])
-                        enable_dual_batch = gr.Checkbox(label="生成双语字幕（批量时副文稿为空）", value=False)
+                        enable_dual_batch = gr.Checkbox(label="生成双语字幕（批量暂不支持）", value=False, interactive=False)
                     with gr.Column(scale=2):
                         batch_status = gr.Textbox(label="批量处理状态", lines=10, interactive=False)
                         batch_system = gr.Textbox(label="系统状态", value=get_system_status(), lines=4, interactive=False)
                         batch_run_btn = gr.Button("开始批量对齐", variant="primary", size="lg")
 
-            # ---------- 帮助标签页 ----------
             with gr.Tab("帮助"):
-                gr.Markdown("""
-                ## 使用说明
+                help_keys = ["single", "batch", "merge_rules", "model_path", "output", "filter_rule"]
+                any_shown = False
+                for key in help_keys:
+                    content = help_data.get(key, "").strip()
+                    if content:
+                        gr.Markdown(content)
+                        any_shown = True
+                if not any_shown:
+                    gr.Markdown("*帮助文件为空或缺失，请检查 help_content.json*")
 
-                ### 单次处理
-                1. 上传音频文件（支持 wav/mp3/m4a/flac/ogg）
-                2. 粘贴主文稿（与音频内容一致，段落间用空行分隔）
-                3. （可选）粘贴副文稿（翻译稿）并勾选“生成双语字幕”
-                4. 调整模型设置和合并规则
-                5. 点击“开始对齐”
+        def toggle_preview(enable):
+            return gr.update(visible=enable), gr.update(visible=not enable)
+        enable_preview.change(toggle_preview, inputs=enable_preview, outputs=[audio_preview, audio_file_only])
 
-                ### 批量处理
-                1. 上传多个音频文件（顺序任意）
-                2. 上传对应的文稿文件（.txt，与音频顺序一一对应）
-                3. 点击“开始批量对齐”
-                4. 系统会为每对音频+文稿生成字幕文件
+        def toggle_anchor_extras(anchor_enabled):
+            return gr.update(visible=anchor_enabled)
+        merge_anchor.change(toggle_anchor_extras, inputs=merge_anchor, outputs=extra_regex_box)
 
-                ### 合并规则说明
-                - **按空行分段**：主文稿中的空行会强制切分字幕（推荐）
-                - **按标点断句**：遇到句末标点（。！？）时切分
-                - **按静音断句**：词间静音超过阈值时切分
-                - **按词数/字符数/时长**：达到上限时强制切分
-
-                ### 模型路径
-                - 默认自动检测 `pretrained_models/FireRedASR2-AED` 或 `FireRedASR2-AED-2025`
-                - 如需指定，在“模型目录”中输入完整路径
-
-                ### 输出文件
-                所有字幕文件保存在 `output/字幕自动打轴/` 目录下。
-                """)
-
-        # 绑定事件（单次）
-        run_btn.click(
-            run_alignment,
-            inputs=[
+        def run_alignment_with_audio_selection(
+            preview_enabled, audio_p, audio_f, primary_text, secondary_text, secondary_lang, enable_dual,
+            use_gpu, use_half, model_dir_override, punc_box, max_words_slider, max_chars_slider,
+            max_duration_slider, silence_slider, merge_punc, merge_silence, merge_wordcount,
+            merge_charcount, merge_duration, merge_newline, merge_anchor, anchor_char_count,
+            extra_regex, progress=gr.Progress()
+        ):
+            audio_input = audio_p if preview_enabled else audio_f
+            return run_alignment(
                 audio_input, primary_text, secondary_text, secondary_lang, enable_dual,
+                use_gpu, use_half, model_dir_override, punc_box, max_words_slider, max_chars_slider,
+                max_duration_slider, silence_slider, merge_punc, merge_silence, merge_wordcount,
+                merge_charcount, merge_duration, merge_newline, merge_anchor, anchor_char_count,
+                extra_regex, progress
+            )
+
+        run_btn.click(
+            fn=run_alignment_with_audio_selection,
+            inputs=[
+                enable_preview, audio_preview, audio_file_only,
+                primary_text, secondary_text, secondary_lang, enable_dual,
                 use_gpu, use_half, model_dir_override,
                 punc_box, max_words_slider, max_chars_slider, max_duration_slider,
                 silence_slider, merge_punc, merge_silence, merge_wordcount,
-                merge_charcount, merge_duration, merge_newline
+                merge_charcount, merge_duration, merge_newline,
+                merge_anchor, anchor_char_count, extra_regex_box
             ],
-            outputs=[task_status, word_output, sent_output, merged_output, secondary_output, dual_output, system_status]
-        )
-        clear_btn.click(
-            clear_outputs,
-            outputs=[task_status, word_output, sent_output, merged_output, secondary_output, dual_output, system_status]
-        ).then(
-            lambda: [None, "", "", "", False],
-            outputs=[audio_input, primary_text, secondary_text, secondary_lang, enable_dual]
+            outputs=[task_status, word_output, sent_output, merged_output, secondary_output, dual_output, anchor_output, system_status]
         )
 
-        # 批量处理事件（修复输出绑定）
+        clear_btn.click(
+            clear_outputs,
+            outputs=[task_status, word_output, sent_output, merged_output, secondary_output, dual_output, anchor_output, system_status]
+        ).then(
+            lambda: [None, None, "", "", "", False, False, 3, ""],
+            outputs=[audio_preview, audio_file_only, primary_text, secondary_text, secondary_lang, enable_dual, merge_anchor, anchor_char_count, extra_regex_box]
+        )
+
         batch_run_btn.click(
             batch_process,
             inputs=[
@@ -967,10 +1013,9 @@ def create_ui():
                 silence_slider, merge_punc, merge_silence, merge_wordcount,
                 merge_charcount, merge_duration, merge_newline
             ],
-            outputs=[batch_status, gr.State(), batch_system]  # 第二个返回值用 State 占位，避免覆盖
+            outputs=[batch_status, batch_system]
         )
 
-        # 页脚
         gr.HTML("""
         <div style="text-align: center; color: #666; font-size: 0.85em; margin-top: 20px;">
             <p>© 2026 光影紐扣 | 基于 FireRedASR2S (Apache 2.0)</p>
@@ -980,7 +1025,6 @@ def create_ui():
 
     return demo
 
-# ==================== 退出清理 ====================
 @atexit.register
 def cleanup():
     logger.info("正在退出，清理资源...")
@@ -993,13 +1037,29 @@ def main():
         logger.error("FireRedASR2S 模块不可用，请检查环境。")
         return
 
+    model_root = ROOT_DIR / "pretrained_models"
+    if not model_root.exists():
+        print(f"警告: 模型目录 {model_root} 不存在，请确保模型已下载。")
+
     demo = create_ui()
-    demo.launch(
-        server_name="127.0.0.1",
-        server_port=18001,
-        inbrowser=True,
-        show_error=True
-    )
+    demo.queue(default_concurrency_limit=1)
+
+    ports = [18001, 18002, 18003, 18004, 18005]
+    for p in ports:
+        try:
+            demo.launch(
+                server_name="127.0.0.1",
+                server_port=p,
+                inbrowser=True,
+                show_error=True,
+                max_file_size=100 * 1024 * 1024
+            )
+            break
+        except OSError:
+            print(f"端口 {p} 被占用，尝试下一个...")
+            continue
+    else:
+        print("所有端口均被占用，请手动指定空闲端口。")
 
 if __name__ == "__main__":
     main()
