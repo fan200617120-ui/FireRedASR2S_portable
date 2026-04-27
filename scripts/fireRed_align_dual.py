@@ -1,13 +1,16 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-FireRedASR2S 文稿对齐 + 双语字幕生成（锚点增强版 · 完全修复）
+FireRedASR2S 文稿对齐 + 双语字幕生成（锚点增强版 · 完全修复 + 音频预处理开关）
 修复列表：
-- anchor_align_segments 缩进错误导致的锚点失效/崩溃
-- current_text 赋值逻辑冗余
-- 时间格式化函数统一
-- 批量处理输出移除无效 gr.State
-- 批量界面提示锚点暂不支持
+- 锚点开始时间逻辑（汉字数足够时也使用锚点）
+- SRT 序号污染（标记移至文本行）
+- 英文/西文空格连接
+- 时间戳单位鲁棒性增强
+- 路径自适应（类似 whisperX 智能根目录）
+- 移除无用 FIRERED_AVAILABLE 检查
+- 新增音频预处理开关（FFmpeg 16k mono，默认开启）
+- 批量处理传递 secondary_lang
 """
 
 import sys, os, re, time, json, gc, logging, threading, atexit, tempfile, shutil, subprocess
@@ -16,7 +19,7 @@ from datetime import timedelta
 from typing import List, Dict, Optional, Tuple, Union
 
 # ==================== 日志配置 ====================
-LOG_DIR = Path(__file__).parent.parent / "logs"
+LOG_DIR = Path(__file__).parent / "logs"  # 修复：日志路径自适应
 LOG_DIR.mkdir(exist_ok=True)
 LOG_FILE = LOG_DIR / f"align_{time.strftime('%Y%m%d')}.log"
 logging.basicConfig(
@@ -29,9 +32,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ==================== 路径设置 ====================
+# ==================== 路径设置（智能项目根） ====================
 CURRENT_DIR = Path(__file__).parent.absolute()
-PROJECT_ROOT = CURRENT_DIR.parent
+# 判断脚本是否在子目录中：如果父目录存在 pretrained_models 或 preset，则父目录为项目根，否则当前目录为根
+if (CURRENT_DIR.parent / "pretrained_models").exists() or (CURRENT_DIR.parent / "preset").exists():
+    PROJECT_ROOT = CURRENT_DIR.parent
+else:
+    PROJECT_ROOT = CURRENT_DIR
 sys.path.insert(0, str(PROJECT_ROOT / "FireRedASR2S"))
 
 try:
@@ -56,8 +63,8 @@ except ImportError as e:
     logger.error(f"缺少基础依赖库: {e}")
     sys.exit(1)
 
-BASE_DIR = Path(__file__).parent.absolute()
-ROOT_DIR = BASE_DIR.parent
+BASE_DIR = CURRENT_DIR
+ROOT_DIR = PROJECT_ROOT
 OUTPUT_DIR = ROOT_DIR / "output" / "字幕自动打轴"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -96,10 +103,13 @@ def sentences_to_srt(sentences: List[Dict]) -> str:
     lines = []
     for i, sent in enumerate(sentences, 1):
         flag = sent.get("flag", "")
-        seq = f"{i}{flag}" if flag else str(i)
-        lines.append(seq)
+        text = sent["text"]
+        # 将置信度标记移到文本行末尾，避免破坏 SRT 序号格式
+        if flag:
+            text += f" {flag}"
+        lines.append(str(i))
         lines.append(f"{seconds_to_srt_time(sent['start'])} --> {seconds_to_srt_time(sent['end'])}")
-        lines.append(sent["text"])
+        lines.append(text)
         lines.append("")
     return "\n".join(lines)
 
@@ -198,7 +208,10 @@ class FireRedAlignManager:
             logger.info("模型已卸载，GPU 显存已清理")
             return True, "系统已卸载"
 
-    def _prepare_audio(self, audio_input):
+    def _prepare_audio(self, audio_input, force_preprocess=True):
+        """返回 (original_path, waveform, sample_rate) 或 None。
+        若 force_preprocess=True，用 FFmpeg 转换为 16k mono 再读取。"""
+        # 获取原始路径
         if isinstance(audio_input, str):
             audio_path = audio_input
         elif isinstance(audio_input, tuple) and len(audio_input) > 0:
@@ -211,6 +224,16 @@ class FireRedAlignManager:
             logger.error(f"音频文件不存在: {audio_path}")
             return None
 
+        if not force_preprocess:
+            # 直接读取，可能失败
+            try:
+                data, sr = sf.read(audio_path, dtype='float32')
+                return audio_path, data, sr
+            except Exception as e:
+                logger.warning(f"直接读取音频失败，尝试 FFmpeg 预处理: {e}")
+                force_preprocess = True
+
+        # 使用 FFmpeg 转换
         with tempfile.NamedTemporaryFile(delete=False, suffix="_16k_mono.wav") as tmp_file:
             tmp_path = tmp_file.name
         cmd = [
@@ -232,7 +255,7 @@ class FireRedAlignManager:
                 data = librosa.resample(data, orig_sr=sr, target_sr=16000)
                 sr = 16000
             self.temp_files.append(tmp_path)
-            return audio_path, data, sr
+            return audio_path, data, sr  # 返回原始路径，但实际使用转写后的数据
         except Exception as e:
             logger.error(f"音频读取失败: {e}", exc_info=True)
             if os.path.exists(tmp_path):
@@ -251,11 +274,11 @@ class FireRedAlignManager:
         self.temp_files = []
         return cleaned
 
-    def force_align(self, audio_input, reference_text, progress_callback=None):
+    def force_align(self, audio_input, reference_text, progress_callback=None, force_preprocess=True):
         if self.asr_system is None:
             return None, None, None, None, "模型未加载"
 
-        audio_prepare_result = self._prepare_audio(audio_input)
+        audio_prepare_result = self._prepare_audio(audio_input, force_preprocess)
         if audio_prepare_result is None:
             return None, None, None, None, "音频处理失败"
 
@@ -301,13 +324,17 @@ class FireRedAlignManager:
             if len(starts) == 0:
                 return None, None, None, None, "时间戳为空"
 
-            max_start = max(starts)
-            if max_start <= T and min(starts) >= 0:
+            # 增强的时间戳单位判断
+            # 优先假设模型返回的是帧索引（0 ~ T 范围）
+            if max(starts) <= T * 1.2 and min(starts) >= -T * 0.2:
+                # 大概率是帧索引
                 timestamps_sec = [(s * frame_shift, e * frame_shift) for s, e in zip(starts, ends)]
-            elif max_start < duration * 1.5:
-                timestamps_sec = list(zip(starts, ends))
-            else:
+            elif max(starts) < duration * 1000 * 1.5:
+                # 可能是毫秒
                 timestamps_sec = [(s / 1000, e / 1000) for s, e in zip(starts, ends)]
+            else:
+                # 可能是秒，但数值已过大，仍按秒处理
+                timestamps_sec = list(zip(starts, ends))
 
             min_len = min(len(timestamps_sec), len(token_ids))
             timestamps_sec = timestamps_sec[:min_len]
@@ -356,6 +383,10 @@ def merge_timestamps_to_sentences(timestamps, words,
     if len(timestamps) == 0:
         return []
 
+    # 智能空格连接：检测是否有中文（或日/韩等无空格语言）
+    has_cjk = any(re.search(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', w) for w in words)
+    join_str = "" if has_cjk else " "
+
     sentences = []
     current_start = timestamps[0][0]
     current_words = []
@@ -385,14 +416,13 @@ def merge_timestamps_to_sentences(timestamps, words,
         if not current_words:
             current_start = start
         current_words.append(word)
-        current_text += word   # 修复冗余三元表达式
         last_end = end
 
         if should_break:
             sentences.append({
                 "start": current_start,
                 "end": last_end,
-                "text": "".join(current_words).strip()
+                "text": join_str.join(current_words).strip()
             })
             current_start = None
             current_words = []
@@ -402,7 +432,7 @@ def merge_timestamps_to_sentences(timestamps, words,
         sentences.append({
             "start": current_start,
             "end": last_end,
-            "text": "".join(current_words).strip()
+            "text": join_str.join(current_words).strip()
         })
     return sentences
 
@@ -451,9 +481,8 @@ def anchor_align_segments(words, word_timestamps, force_break_indices, audio_dur
                 confidence_flag = "[!] 首部汉字不足"
                 if merge_warnings is not None:
                     merge_warnings.append(f"第{idx+1}段：首部汉字不足（仅{len(chinese_indices)}个），锚点可能偏移")
-                seg_start = seg_ts[chinese_indices[0]][0]
-            else:
-                seg_start = seg_ts[0][0]   # 汉字足够，仍用第一个词开始
+            # 修复：无论汉字数是否足够，都使用第一个汉字的时间作为锚点
+            seg_start = seg_ts[chinese_indices[0]][0]
         else:
             confidence_flag = "[!] 无汉字"
             if merge_warnings is not None:
@@ -512,7 +541,8 @@ def run_alignment(
     merge_punctuations, merge_max_words, merge_max_chars, merge_max_duration,
     merge_silence_threshold, merge_by_punc, merge_by_silence, merge_by_wordcount,
     merge_by_charcount, merge_by_duration, merge_by_newline,
-    use_anchor, anchor_char_count, extra_regex="", progress=gr.Progress()
+    use_anchor, anchor_char_count, extra_regex="",
+    force_preprocess=True, progress=gr.Progress()
 ):
     if audio_file is None:
         return "错误: 请上传音频文件", "", "", "", "", "", "", get_system_status()
@@ -534,7 +564,8 @@ def run_alignment(
         return f"错误: {msg}", "", "", "", "", "", "", get_system_status()
 
     progress(0.2, desc="强制对齐中...")
-    word_srt, sent_srt, timestamps, words, error = manager.force_align(audio_path, primary_text_cleaned)
+    word_srt, sent_srt, timestamps, words, error = manager.force_align(audio_path, primary_text_cleaned,
+                                                                       force_preprocess=force_preprocess)
     if error:
         return f"错误: {error}", "", "", "", "", "", "", get_system_status()
 
@@ -720,12 +751,12 @@ def clear_outputs():
     return "等待开始", "", "", "", "", "", "", get_system_status()
 
 def batch_process(
-    audio_files, text_files, enable_dual_batch,
+    audio_files, text_files, enable_dual_batch, secondary_lang,
     use_gpu, use_half, model_dir_override,
     merge_punctuations, merge_max_words, merge_max_chars, merge_max_duration,
     merge_silence_threshold, merge_by_punc, merge_by_silence, merge_by_wordcount,
     merge_by_charcount, merge_by_duration, merge_by_newline,
-    progress=gr.Progress()
+    force_preprocess=True, progress=gr.Progress()
 ):
     if not audio_files or not text_files:
         return "请上传音频文件和对应的文稿文件（数量相同，顺序对应）", get_system_status()
@@ -756,7 +787,8 @@ def batch_process(
             results.append(f"❌ {os.path.basename(audio_path)}: 读取文稿失败 - {e}")
             continue
 
-        word_srt, sent_srt, timestamps, words, error = manager.force_align(audio_path, primary_text)
+        word_srt, sent_srt, timestamps, words, error = manager.force_align(audio_path, primary_text,
+                                                                           force_preprocess=force_preprocess)
         if error:
             results.append(f"❌ {os.path.basename(audio_path)}: 对齐失败 - {error}")
             continue
@@ -875,6 +907,9 @@ def create_ui():
                         audio_preview = gr.Audio(label="选择音频文件", type="filepath", sources=["upload"], visible=True)
                         audio_file_only = gr.File(label="选择音频文件", file_types=[".wav",".mp3",".m4a",".flac",".ogg"], visible=False)
 
+                        # 新增预处理开关
+                        force_preprocess_check = gr.Checkbox(label="⚡ 强制预处理为 16kHz 单声道 (推荐)", value=True)
+
                         primary_text = gr.Textbox(label="主文稿（对齐用）", lines=18, placeholder="粘贴与音频内容一致的稿子...\n段落之间用空行分隔")
                         secondary_text = gr.Textbox(label="副文稿（挂载用，可选）", lines=18, placeholder="粘贴翻译稿...\n段落结构尽量与主文稿一致")
                         with gr.Row():
@@ -942,6 +977,8 @@ def create_ui():
                         audio_files = gr.File(label="上传音频文件（可多选）", file_count="multiple", file_types=[".wav",".mp3",".m4a",".flac",".ogg"])
                         text_files = gr.File(label="上传对应的文稿文件（顺序对应）", file_count="multiple", file_types=[".txt"])
                         enable_dual_batch = gr.Checkbox(label="生成双语字幕（批量暂不支持）", value=False, interactive=False)
+                        secondary_lang_batch = gr.Textbox(label="副文稿语言标记（批量）", value="")
+                        force_preprocess_batch = gr.Checkbox(label="⚡ 强制预处理为 16kHz 单声道", value=True)
                     with gr.Column(scale=2):
                         batch_status = gr.Textbox(label="批量处理状态", lines=10, interactive=False)
                         batch_system = gr.Textbox(label="系统状态", value=get_system_status(), lines=4, interactive=False)
@@ -967,9 +1004,10 @@ def create_ui():
         merge_anchor.change(toggle_anchor_extras, inputs=merge_anchor, outputs=extra_regex_box)
 
         def run_alignment_with_audio_selection(
-            preview_enabled, audio_p, audio_f, primary_text, secondary_text, secondary_lang, enable_dual,
-            use_gpu, use_half, model_dir_override, punc_box, max_words_slider, max_chars_slider,
-            max_duration_slider, silence_slider, merge_punc, merge_silence, merge_wordcount,
+            preview_enabled, audio_p, audio_f, force_preprocess, primary_text, secondary_text,
+            secondary_lang, enable_dual, use_gpu, use_half, model_dir_override,
+            punc_box, max_words_slider, max_chars_slider, max_duration_slider,
+            silence_slider, merge_punc, merge_silence, merge_wordcount,
             merge_charcount, merge_duration, merge_newline, merge_anchor, anchor_char_count,
             extra_regex, progress=gr.Progress()
         ):
@@ -979,13 +1017,13 @@ def create_ui():
                 use_gpu, use_half, model_dir_override, punc_box, max_words_slider, max_chars_slider,
                 max_duration_slider, silence_slider, merge_punc, merge_silence, merge_wordcount,
                 merge_charcount, merge_duration, merge_newline, merge_anchor, anchor_char_count,
-                extra_regex, progress
+                extra_regex, force_preprocess, progress
             )
 
         run_btn.click(
             fn=run_alignment_with_audio_selection,
             inputs=[
-                enable_preview, audio_preview, audio_file_only,
+                enable_preview, audio_preview, audio_file_only, force_preprocess_check,
                 primary_text, secondary_text, secondary_lang, enable_dual,
                 use_gpu, use_half, model_dir_override,
                 punc_box, max_words_slider, max_chars_slider, max_duration_slider,
@@ -1000,18 +1038,20 @@ def create_ui():
             clear_outputs,
             outputs=[task_status, word_output, sent_output, merged_output, secondary_output, dual_output, anchor_output, system_status]
         ).then(
-            lambda: [None, None, "", "", "", False, False, 3, ""],
-            outputs=[audio_preview, audio_file_only, primary_text, secondary_text, secondary_lang, enable_dual, merge_anchor, anchor_char_count, extra_regex_box]
+            lambda: [None, None, "", "", "", False, False, 3, "", True],
+            outputs=[audio_preview, audio_file_only, primary_text, secondary_text, secondary_lang,
+                     enable_dual, merge_anchor, anchor_char_count, extra_regex_box, force_preprocess_check]
         )
 
         batch_run_btn.click(
             batch_process,
             inputs=[
-                audio_files, text_files, enable_dual_batch,
+                audio_files, text_files, enable_dual_batch, secondary_lang_batch,
                 use_gpu, use_half, model_dir_override,
                 punc_box, max_words_slider, max_chars_slider, max_duration_slider,
                 silence_slider, merge_punc, merge_silence, merge_wordcount,
-                merge_charcount, merge_duration, merge_newline
+                merge_charcount, merge_duration, merge_newline,
+                force_preprocess_batch
             ],
             outputs=[batch_status, batch_system]
         )
@@ -1033,10 +1073,6 @@ def cleanup():
     logger.info("清理完成")
 
 def main():
-    if not FIRERED_AVAILABLE:
-        logger.error("FireRedASR2S 模块不可用，请检查环境。")
-        return
-
     model_root = ROOT_DIR / "pretrained_models"
     if not model_root.exists():
         print(f"警告: 模型目录 {model_root} 不存在，请确保模型已下载。")
@@ -1052,7 +1088,7 @@ def main():
                 server_port=p,
                 inbrowser=True,
                 show_error=True,
-                max_file_size=100 * 1024 * 1024
+                max_file_size=500 * 1024 * 1024   # 与 whisperX 一致，500MB
             )
             break
         except OSError:
@@ -1060,6 +1096,7 @@ def main():
             continue
     else:
         print("所有端口均被占用，请手动指定空闲端口。")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
