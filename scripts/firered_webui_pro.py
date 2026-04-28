@@ -55,12 +55,18 @@ else:
     PROJECT_ROOT = CURRENT_DIR
 sys.path.insert(0, str(PROJECT_ROOT / "FireRedASR2S"))
 
-# 导入 FireRedASR2S 模块
-from fireredasr2s import FireRedAsr2System, FireRedAsr2SystemConfig
-from fireredasr2s.fireredasr2 import FireRedAsr2Config
-from fireredasr2s.fireredvad import FireRedVadConfig
-from fireredasr2s.fireredlid import FireRedLidConfig
-from fireredasr2s.fireredpunc import FireRedPuncConfig
+# ==================== 导入检查 ====================
+FIRERED_AVAILABLE = False
+try:
+    from fireredasr2s import FireRedAsr2System, FireRedAsr2SystemConfig
+    from fireredasr2s.fireredasr2 import FireRedAsr2Config
+    from fireredasr2s.fireredvad import FireRedVadConfig
+    from fireredasr2s.fireredlid import FireRedLidConfig
+    from fireredasr2s.fireredpunc import FireRedPuncConfig
+    FIRERED_AVAILABLE = True
+    print("FireRedASR2S 模块导入成功")
+except ImportError as e:
+    print(f"导入 FireRedASR2S 失败: {e}")
 
 # ==================== 基础路径 ====================
 BASE_DIR = Path(__file__).parent.absolute()
@@ -115,13 +121,6 @@ def save_settings(settings):
         print(f"保存配置失败: {e}")
 
 # ==================== 导入检查 ====================
-try:
-    FIRERED_AVAILABLE = True
-    print("FireRedASR2S 模块导入成功")
-except ImportError as e:
-    FIRERED_AVAILABLE = False
-    print(f"导入 FireRedASR2S 失败: {e}")
-
 try:
     import gradio as gr
     import torch
@@ -281,6 +280,7 @@ class FireRedASR2SManager:
                     pass
             return None, None, f"识别失败: {str(e)}"
 
+    # 修复 Bug 4：异常时根据 return_waveform 返回正确数量的 None
     def _prepare_audio(self, audio_input, force_preprocess=True, return_waveform=False):
         """使用 FFmpeg 预处理为 16k 单声道 wav，可选关闭强制预处理"""
         try:
@@ -295,6 +295,8 @@ class FireRedASR2SManager:
                 sf.write(input_path, data.astype(np.float32), sr)
                 self.temp_files.append(input_path)
             else:
+                if return_waveform:
+                    return None, None, None
                 return None
 
             if not force_preprocess:
@@ -320,6 +322,8 @@ class FireRedASR2SManager:
                 return out_path
         except Exception as e:
             logging.error(f"音频预处理失败: {e}")
+            if return_waveform:
+                return None, None, None
             return None
 
     def cleanup_temp(self):
@@ -790,13 +794,13 @@ def transcribe_audio(audio, asr_model_type, use_gpu, use_half, enable_vad, enabl
     progress(1.0, desc="完成")
     return full_text, timestamps_json, srt_text
 
-# ==================== 视频字幕处理函数（新增合并参数） ====================
+# ==================== 视频字幕处理函数（移除 subtitle_mode 参数） ====================
 def transcribe_video(video, asr_model_type, use_gpu, use_half, enable_vad, enable_lid, enable_punc,
                      beam_size, nbest, decode_max_len, softmax_smoothing, aed_length_penalty,
                      eos_penalty, elm_weight,
                      vad_min_speech_frame, vad_max_speech_frame, vad_min_silence_frame,
                      vad_speech_threshold, vad_smooth_window_size,
-                     punc_threshold, subtitle_mode,
+                     punc_threshold,
                      merge_max_duration, merge_max_chars, merge_punctuations, merge_silence_threshold,
                      force_preprocess,
                      progress=gr.Progress()):
@@ -906,7 +910,7 @@ def transcribe_batch(files, asr_model_type, use_gpu, use_half, enable_vad, enabl
                      force_preprocess,
                      progress=gr.Progress()):
     if not files:
-        return "请选择音频文件", "", ""
+        return "请选择音频文件"
 
     try:
         ensure_model_loaded(asr_model_type, use_gpu, use_half,
@@ -919,7 +923,7 @@ def transcribe_batch(files, asr_model_type, use_gpu, use_half, enable_vad, enabl
                             vad_smooth_window_size, punc_threshold,
                             progress)
     except RuntimeError as e:
-        return str(e), "", ""
+        return str(e)
 
     results_text = []
     total = len(files)
@@ -944,7 +948,7 @@ def transcribe_batch(files, asr_model_type, use_gpu, use_half, enable_vad, enabl
             results_text.append(f"【{os.path.basename(file_path)}】\n已保存:\n    {file_list}\n")
     progress(1.0, desc="完成")
     manager.cleanup_temp()
-    return "\n".join(results_text), "", ""
+    return "\n".join(results_text)
 
 def load_model_click(asr_model_type, use_gpu, use_half, enable_vad, enable_lid, enable_punc,
                      beam_size, nbest, decode_max_len, softmax_smoothing, aed_length_penalty,
@@ -1121,6 +1125,17 @@ def force_align_wrapper(audio, text, asr_model_type, use_gpu, use_half,
     progress(1.0, desc="完成")
     return word_srt, sent_srt, merged_srt
 
+# ==================== 修复 Bug 5：跨平台打开文件夹函数 ====================
+def open_file_or_dir(path: str):
+    """跨平台打开文件/文件夹"""
+    path = str(path)
+    if sys.platform == "win32":
+        os.startfile(path)
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", path])
+    else:
+        subprocess.Popen(["xdg-open", path])
+
 # ==================== 创建 Gradio 界面 ====================
 def create_interface():
     settings = manager.settings
@@ -1136,9 +1151,9 @@ def create_interface():
     if llm_dir.exists():
         model_choices.append("llm")
 
-    with gr.Blocks(title="FireRedASR2S WebUI 专业版 增强融合版", theme=gr.themes.Default()) as demo:
+    with gr.Blocks(title="FireRedASR2S WebUI 增强融合版", theme=gr.themes.Default()) as demo:
         gr.Markdown(f"""
-        # FireRedASR2S 语音识别系统 专业版 (增强融合版)
+        # FireRedASR2S 语音识别系统 增强融合版
         **支持 VAD、LID、标点恢复、时间戳、SRT字幕生成**
         输出目录: `{OUTPUT_DIR}`
         字幕自动打轴输出: `{ALIGN_OUTPUT_DIR}`
@@ -1151,6 +1166,9 @@ def create_interface():
                 with gr.Column(scale=1):
                     refresh_btn = gr.Button("刷新状态", variant="secondary")
                     health_btn = gr.Button("健康检查", variant="secondary")
+
+        # 修复 Bug 2：增加操作提示组件
+        load_msg = gr.Textbox(label="操作提示", interactive=False, visible=True)
 
         def health_check():
             info = get_system_info()
@@ -1220,7 +1238,7 @@ def create_interface():
             gr.Markdown("### Punc 参数")
             punc_threshold = gr.Slider(label="标点阈值", minimum=0.1, maximum=0.9, value=0.45, step=0.05, visible=True)
 
-        # 基础按钮绑定
+        # 基础按钮绑定（修复 Bug 2：输出到 load_msg 和 status_display）
         load_btn.click(
             load_model_click,
             inputs=[asr_model_type, use_gpu, use_half, enable_vad, enable_lid, enable_punc,
@@ -1229,9 +1247,9 @@ def create_interface():
                     vad_min_speech_frame, vad_max_speech_frame, vad_min_silence_frame,
                     vad_speech_threshold, vad_smooth_window_size,
                     punc_threshold],
-            outputs=[status_display, status_display]  # 保持两个输出
+            outputs=[load_msg, status_display]
         )
-        unload_btn.click(unload_model_click, outputs=[status_display, status_display])
+        unload_btn.click(unload_model_click, outputs=[load_msg, status_display])
         refresh_btn.click(refresh_status, outputs=[status_display])
 
         gr.Markdown("---")
@@ -1240,6 +1258,9 @@ def create_interface():
         with gr.Tabs():
             # ---------- 音频识别 ----------
             with gr.Tab("音频识别"):
+                # 修复 Bug 1：声明共享的音频路径状态
+                audio_path_state = gr.State()
+
                 with gr.Row():
                     with gr.Column(scale=1):
                         gr.Markdown("### 上传音频")
@@ -1295,10 +1316,10 @@ def create_interface():
                 transcribe_btn.click(
                     get_audio_path,
                     inputs=[input_mode, audio_file, audio_mic],
-                    outputs=[gr.State()]
+                    outputs=[audio_path_state]   # 保存到共享状态
                 ).then(
                     transcribe_audio,
-                    inputs=[gr.State(), asr_model_type, use_gpu, use_half, enable_vad, enable_lid, enable_punc,
+                    inputs=[audio_path_state, asr_model_type, use_gpu, use_half, enable_vad, enable_lid, enable_punc,
                             beam_size, nbest, decode_max_len, softmax_smoothing, aed_length_penalty,
                             eos_penalty, elm_weight,
                             vad_min_speech_frame, vad_max_speech_frame, vad_min_silence_frame,
@@ -1314,7 +1335,7 @@ def create_interface():
                     outputs=[audio_file, text_output, json_output, srt_output]
                 )
 
-            # ---------- 视频字幕（新增合并参数） ----------
+            # ---------- 视频字幕（移除 subtitle_mode） ----------
             with gr.Tab("视频字幕"):
                 with gr.Row():
                     with gr.Column(scale=1):
@@ -1324,15 +1345,9 @@ def create_interface():
                             sources=["upload"],
                             interactive=True
                         )
-                        subtitle_mode = gr.Radio(
-                            label="字幕嵌入模式（已失效，仅保留界面）",
-                            choices=["soft", "hard"],
-                            value="soft",
-                            info="功能已关闭，仅生成字幕文件"
-                        )
                         force_preprocess_video = gr.Checkbox(label="⚡ 强制预处理音频 (推荐)", value=True)
 
-                        # 新增：视频字幕合并参数
+                        # 字幕合并参数
                         with gr.Accordion("字幕合并参数", open=True):
                             video_merge_max_duration = gr.Slider(1.0, 20.0, 10.0, step=0.5, label="单条最大时长 (秒)")
                             video_merge_max_chars = gr.Slider(5, 100, 30, step=5, label="单条最大字符数")
@@ -1358,7 +1373,7 @@ def create_interface():
                             eos_penalty, elm_weight,
                             vad_min_speech_frame, vad_max_speech_frame, vad_min_silence_frame,
                             vad_speech_threshold, vad_smooth_window_size,
-                            punc_threshold, subtitle_mode,
+                            punc_threshold,
                             video_merge_max_duration, video_merge_max_chars, video_merge_punctuations, video_merge_silence_threshold,
                             force_preprocess_video],
                     outputs=[video_text_output, video_json_output, video_srt_output]
@@ -1393,7 +1408,7 @@ def create_interface():
                             vad_speech_threshold, vad_smooth_window_size,
                             punc_threshold,
                             force_preprocess_batch],
-                    outputs=[batch_output, gr.State(), gr.State()]
+                    outputs=[batch_output]
                 ).then(refresh_status, outputs=[status_display])
 
                 batch_clear.click(
@@ -1533,13 +1548,14 @@ def create_interface():
                     outputs=[config_status, system_info_text]
                 )
 
+                # 修复 Bug 5：使用跨平台函数
                 def open_output():
-                    os.startfile(str(OUTPUT_DIR))
+                    open_file_or_dir(str(OUTPUT_DIR))
                     return "已打开输出目录"
                 open_output_btn.click(open_output, outputs=[config_status])
 
                 def open_log():
-                    os.startfile(str(LOG_DIR))
+                    open_file_or_dir(str(LOG_DIR))
                     return "已打开日志文件夹"
                 open_log_btn.click(open_log, outputs=[config_status])
 
@@ -1548,6 +1564,7 @@ def create_interface():
                     return f"清理了 {cleaned} 个临时文件"
                 clear_cache_btn.click(clear_cache, outputs=[config_status])
 
+                # 保存当前配置（增加 merge_punctuations_align 的保存）
                 def save_current_config():
                     config = {
                         "asr_model_type": asr_model_type.value,
@@ -1569,7 +1586,8 @@ def create_interface():
                         "vad_speech_threshold": vad_speech_threshold.value,
                         "vad_smooth_window_size": vad_smooth_window_size.value,
                         "punc_threshold": punc_threshold.value,
-                        "merge_punctuations": merge_punctuations.value,
+                        "merge_punctuations": merge_punctuations.value,        # 音频识别页
+                        "merge_punctuations_align": merge_punctuations_align.value,  # 强制对齐页
                         "merge_max_words": align_max_words.value,
                         "merge_max_chars": align_max_chars.value,
                         "merge_max_duration": align_max_duration.value,
@@ -1598,61 +1616,54 @@ def create_interface():
                     return gr.update(choices=new_choices)
                 refresh_preset_btn.click(refresh_preset_list, outputs=[preset_selector])
 
+                # 加载所选配置（动态更新，匹配 components 列表长度）
+                # 注意：输出列表顺序与下方 keys 严格对应
+                _PARAM_KEYS = [
+                    "asr_model_type", "use_gpu", "use_half", "enable_vad", "enable_lid", "enable_punc",
+                    "beam_size", "nbest", "decode_max_len", "softmax_smoothing", "aed_length_penalty", "eos_penalty", "elm_weight",
+                    "vad_min_speech_frame", "vad_max_speech_frame", "vad_min_silence_frame", "vad_speech_threshold", "vad_smooth_window_size", "punc_threshold",
+                    "merge_punctuations", "merge_max_words", "merge_max_chars", "merge_max_duration", "merge_silence_threshold",
+                    "merge_by_punc", "merge_by_silence", "merge_by_wordcount", "merge_by_charcount", "merge_by_duration", "merge_by_newline",
+                    "preview_max_size_mb", "merge_punctuations_align"
+                ]
+                _PARAM_DEFAULTS = {
+                    "asr_model_type": "aed", "use_gpu": True, "use_half": False, "enable_vad": True, "enable_lid": True, "enable_punc": True,
+                    "beam_size": 3, "nbest": 1, "decode_max_len": 0, "softmax_smoothing": 1.25, "aed_length_penalty": 0.6, "eos_penalty": 1.0, "elm_weight": 0.0,
+                    "vad_min_speech_frame": 20, "vad_max_speech_frame": 2000, "vad_min_silence_frame": 20, "vad_speech_threshold": 0.4, "vad_smooth_window_size": 5, "punc_threshold": 0.45,
+                    "merge_punctuations": "。！？.!?", "merge_max_words": 20, "merge_max_chars": 30, "merge_max_duration": 10.0, "merge_silence_threshold": 0.3,
+                    "merge_by_punc": True, "merge_by_silence": True, "merge_by_wordcount": True, "merge_by_charcount": True, "merge_by_duration": True, "merge_by_newline": False,
+                    "preview_max_size_mb": 5, "merge_punctuations_align": "。！？.!?"
+                }
+
                 def load_selected_config(filename):
                     if not filename:
-                        return ["请先选择一个预设文件"] + [gr.update() for _ in range(31)]  # 组件数量需匹配
+                        return ["请先选择一个预设文件"] + [gr.update() for _ in _PARAM_KEYS]
+
                     file_path = PRESET_DIR / filename
                     try:
                         with open(file_path, 'r', encoding='utf-8') as f:
                             cfg = json.load(f)
                     except Exception as e:
-                        return [f"加载失败: {e}"] + [gr.update() for _ in range(31)]
+                        return [f"加载失败: {e}"] + [gr.update() for _ in _PARAM_KEYS]
 
-                    updates = [
-                        gr.update(value=cfg.get("asr_model_type", "aed")),
-                        gr.update(value=cfg.get("use_gpu", True)),
-                        gr.update(value=cfg.get("use_half", False)),
-                        gr.update(value=cfg.get("enable_vad", True)),
-                        gr.update(value=cfg.get("enable_lid", True)),
-                        gr.update(value=cfg.get("enable_punc", True)),
-                        gr.update(value=cfg.get("beam_size", 3)),
-                        gr.update(value=cfg.get("nbest", 1)),
-                        gr.update(value=cfg.get("decode_max_len", 0)),
-                        gr.update(value=cfg.get("softmax_smoothing", 1.25)),
-                        gr.update(value=cfg.get("aed_length_penalty", 0.6)),
-                        gr.update(value=cfg.get("eos_penalty", 1.0)),
-                        gr.update(value=cfg.get("elm_weight", 0.0)),
-                        gr.update(value=cfg.get("vad_min_speech_frame", 20)),
-                        gr.update(value=cfg.get("vad_max_speech_frame", 2000)),
-                        gr.update(value=cfg.get("vad_min_silence_frame", 20)),
-                        gr.update(value=cfg.get("vad_speech_threshold", 0.4)),
-                        gr.update(value=cfg.get("vad_smooth_window_size", 5)),
-                        gr.update(value=cfg.get("punc_threshold", 0.45)),
-                        gr.update(value=cfg.get("merge_punctuations", "。！？.!?")),
-                        gr.update(value=cfg.get("merge_max_words", 20)),
-                        gr.update(value=cfg.get("merge_max_chars", 30)),
-                        gr.update(value=cfg.get("merge_max_duration", 10.0)),
-                        gr.update(value=cfg.get("merge_silence_threshold", 0.3)),
-                        gr.update(value=cfg.get("merge_by_punc", True)),
-                        gr.update(value=cfg.get("merge_by_silence", True)),
-                        gr.update(value=cfg.get("merge_by_wordcount", True)),
-                        gr.update(value=cfg.get("merge_by_charcount", True)),
-                        gr.update(value=cfg.get("merge_by_duration", True)),
-                        gr.update(value=cfg.get("merge_by_newline", False)),
-                        gr.update(value=cfg.get("preview_max_size_mb", 5)),
-                    ]
+                    updates = []
+                    for key in _PARAM_KEYS:
+                        val = cfg.get(key, _PARAM_DEFAULTS.get(key))
+                        updates.append(gr.update(value=val))
                     return [f"配置已加载: {filename}"] + updates
 
+                # outputs 列表与 _PARAM_KEYS 一一对应，前面加 config_status
                 load_config_btn.click(
                     load_selected_config,
                     inputs=[preset_selector],
-                    outputs=[config_status,
-                             asr_model_type, use_gpu, use_half, enable_vad, enable_lid, enable_punc,
-                             beam_size, nbest, decode_max_len, softmax_smoothing, aed_length_penalty, eos_penalty, elm_weight,
-                             vad_min_speech_frame, vad_max_speech_frame, vad_min_silence_frame, vad_speech_threshold, vad_smooth_window_size, punc_threshold,
-                             merge_punctuations, align_max_words, align_max_chars, align_max_duration, align_silence_threshold,
-                             merge_by_punc, merge_by_silence, merge_by_wordcount, merge_by_charcount, merge_by_duration, merge_by_newline,
-                             preview_max_size]
+                    outputs=[config_status] + [
+                        asr_model_type, use_gpu, use_half, enable_vad, enable_lid, enable_punc,
+                        beam_size, nbest, decode_max_len, softmax_smoothing, aed_length_penalty, eos_penalty, elm_weight,
+                        vad_min_speech_frame, vad_max_speech_frame, vad_min_silence_frame, vad_speech_threshold, vad_smooth_window_size, punc_threshold,
+                        merge_punctuations, align_max_words, align_max_chars, align_max_duration, align_silence_threshold,
+                        merge_by_punc, merge_by_silence, merge_by_wordcount, merge_by_charcount, merge_by_duration, merge_by_newline,
+                        preview_max_size, merge_punctuations_align
+                    ]
                 )
 
         # 页脚版权
@@ -1702,7 +1713,7 @@ def main():
         server_port=18006,
         inbrowser=True,
         show_error=True,
-        max_file_size=500 * 1024 * 1024   # 提升至 500 MB
+        max_file_size=500 * 1024 * 1024   
     )
 
 if __name__ == "__main__":

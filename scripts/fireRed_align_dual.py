@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-FireRedASR2S 文稿对齐 + 双语字幕生成（锚点增强版 · 完全修复 + 音频预处理开关）
+FireRedASR2S 文稿对齐 + 双语字幕生成（锚点增强版）
 修复列表：
 - 锚点开始时间逻辑（汉字数足够时也使用锚点）
 - SRT 序号污染（标记移至文本行）
@@ -11,6 +11,8 @@ FireRedASR2S 文稿对齐 + 双语字幕生成（锚点增强版 · 完全修复
 - 移除无用 FIRERED_AVAILABLE 检查
 - 新增音频预处理开关（FFmpeg 16k mono，默认开启）
 - 批量处理传递 secondary_lang
+- 双开关保留：大文件模式新增只读试听
+- 智能空格拼接（中英混合正确分隔）
 """
 
 import sys, os, re, time, json, gc, logging, threading, atexit, tempfile, shutil, subprocess
@@ -19,7 +21,7 @@ from datetime import timedelta
 from typing import List, Dict, Optional, Tuple, Union
 
 # ==================== 日志配置 ====================
-LOG_DIR = Path(__file__).parent / "logs"  # 修复：日志路径自适应
+LOG_DIR = Path(__file__).parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 LOG_FILE = LOG_DIR / f"align_{time.strftime('%Y%m%d')}.log"
 logging.basicConfig(
@@ -34,7 +36,6 @@ logger = logging.getLogger(__name__)
 
 # ==================== 路径设置（智能项目根） ====================
 CURRENT_DIR = Path(__file__).parent.absolute()
-# 判断脚本是否在子目录中：如果父目录存在 pretrained_models 或 preset，则父目录为项目根，否则当前目录为根
 if (CURRENT_DIR.parent / "pretrained_models").exists() or (CURRENT_DIR.parent / "preset").exists():
     PROJECT_ROOT = CURRENT_DIR.parent
 else:
@@ -104,7 +105,6 @@ def sentences_to_srt(sentences: List[Dict]) -> str:
     for i, sent in enumerate(sentences, 1):
         flag = sent.get("flag", "")
         text = sent["text"]
-        # 将置信度标记移到文本行末尾，避免破坏 SRT 序号格式
         if flag:
             text += f" {flag}"
         lines.append(str(i))
@@ -112,6 +112,24 @@ def sentences_to_srt(sentences: List[Dict]) -> str:
         lines.append(text)
         lines.append("")
     return "\n".join(lines)
+
+# ==================== 智能空格拼接 ====================
+def _is_cjk_word(word: str) -> bool:
+    """判断单词是否包含中日韩文字"""
+    return bool(re.search(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', word))
+
+def _smart_join(words: List[str]) -> str:
+    """根据相邻单词的语言类型自动添加空格"""
+    if not words:
+        return ""
+    parts = [words[0]]
+    for i in range(1, len(words)):
+        prev_non_cjk = not _is_cjk_word(words[i-1])
+        curr_non_cjk = not _is_cjk_word(words[i])
+        if prev_non_cjk and curr_non_cjk:
+            parts.append(" ")
+        parts.append(words[i])
+    return "".join(parts)
 
 # ==================== 模型管理器 ====================
 class FireRedAlignManager:
@@ -209,9 +227,7 @@ class FireRedAlignManager:
             return True, "系统已卸载"
 
     def _prepare_audio(self, audio_input, force_preprocess=True):
-        """返回 (original_path, waveform, sample_rate) 或 None。
-        若 force_preprocess=True，用 FFmpeg 转换为 16k mono 再读取。"""
-        # 获取原始路径
+        """返回 (original_path, waveform, sample_rate) 或 None。"""
         if isinstance(audio_input, str):
             audio_path = audio_input
         elif isinstance(audio_input, tuple) and len(audio_input) > 0:
@@ -225,7 +241,6 @@ class FireRedAlignManager:
             return None
 
         if not force_preprocess:
-            # 直接读取，可能失败
             try:
                 data, sr = sf.read(audio_path, dtype='float32')
                 return audio_path, data, sr
@@ -233,7 +248,6 @@ class FireRedAlignManager:
                 logger.warning(f"直接读取音频失败，尝试 FFmpeg 预处理: {e}")
                 force_preprocess = True
 
-        # 使用 FFmpeg 转换
         with tempfile.NamedTemporaryFile(delete=False, suffix="_16k_mono.wav") as tmp_file:
             tmp_path = tmp_file.name
         cmd = [
@@ -255,7 +269,7 @@ class FireRedAlignManager:
                 data = librosa.resample(data, orig_sr=sr, target_sr=16000)
                 sr = 16000
             self.temp_files.append(tmp_path)
-            return audio_path, data, sr  # 返回原始路径，但实际使用转写后的数据
+            return audio_path, data, sr
         except Exception as e:
             logger.error(f"音频读取失败: {e}", exc_info=True)
             if os.path.exists(tmp_path):
@@ -324,16 +338,11 @@ class FireRedAlignManager:
             if len(starts) == 0:
                 return None, None, None, None, "时间戳为空"
 
-            # 增强的时间戳单位判断
-            # 优先假设模型返回的是帧索引（0 ~ T 范围）
             if max(starts) <= T * 1.2 and min(starts) >= -T * 0.2:
-                # 大概率是帧索引
                 timestamps_sec = [(s * frame_shift, e * frame_shift) for s, e in zip(starts, ends)]
             elif max(starts) < duration * 1000 * 1.5:
-                # 可能是毫秒
                 timestamps_sec = [(s / 1000, e / 1000) for s, e in zip(starts, ends)]
             else:
-                # 可能是秒，但数值已过大，仍按秒处理
                 timestamps_sec = list(zip(starts, ends))
 
             min_len = min(len(timestamps_sec), len(token_ids))
@@ -383,15 +392,10 @@ def merge_timestamps_to_sentences(timestamps, words,
     if len(timestamps) == 0:
         return []
 
-    # 智能空格连接：检测是否有中文（或日/韩等无空格语言）
-    has_cjk = any(re.search(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', w) for w in words)
-    join_str = "" if has_cjk else " "
-
     sentences = []
     current_start = timestamps[0][0]
     current_words = []
     last_end = timestamps[0][1]
-    current_text = ""
 
     for i, ((start, end), word) in enumerate(zip(timestamps, words)):
         should_break = False
@@ -407,7 +411,9 @@ def merge_timestamps_to_sentences(timestamps, words,
             if not should_break and merge_by_wordcount and len(current_words) + 1 >= max_words:
                 should_break = True
             if not should_break and merge_by_charcount and current_words:
-                if len(current_text + word) >= max_chars:
+                # 智能拼接后判断字符数
+                test_text = _smart_join(current_words + [word])
+                if len(test_text) >= max_chars:
                     should_break = True
             if not should_break and merge_by_duration and current_words:
                 if (last_end - current_start) + (end - start) >= max_duration:
@@ -422,17 +428,16 @@ def merge_timestamps_to_sentences(timestamps, words,
             sentences.append({
                 "start": current_start,
                 "end": last_end,
-                "text": join_str.join(current_words).strip()
+                "text": _smart_join(current_words).strip()
             })
             current_start = None
             current_words = []
-            current_text = ""
 
     if current_words:
         sentences.append({
             "start": current_start,
             "end": last_end,
-            "text": join_str.join(current_words).strip()
+            "text": _smart_join(current_words).strip()
         })
     return sentences
 
@@ -471,17 +476,17 @@ def anchor_align_segments(words, word_timestamps, force_break_indices, audio_dur
 
     result_sentences = []
     for idx, (seg_words, seg_ts) in enumerate(segments):
-        seg_text = "".join(seg_words).strip()
+        # 使用智能拼接代替简单 join
+        seg_text = _smart_join(seg_words).strip()
         if not seg_text:
             continue
-        chinese_indices = [i for i, w in enumerate(seg_words) if re.search(r'[\u4e00-\u9fff]', w)]
+        chinese_indices = [i for i, w in enumerate(seg_words) if _is_cjk_word(w)]
         confidence_flag = ""
         if chinese_indices:
             if len(chinese_indices) < anchor_char_count:
                 confidence_flag = "[!] 首部汉字不足"
                 if merge_warnings is not None:
                     merge_warnings.append(f"第{idx+1}段：首部汉字不足（仅{len(chinese_indices)}个），锚点可能偏移")
-            # 修复：无论汉字数是否足够，都使用第一个汉字的时间作为锚点
             seg_start = seg_ts[chinese_indices[0]][0]
         else:
             confidence_flag = "[!] 无汉字"
@@ -903,11 +908,13 @@ def create_ui():
             with gr.Tab("单次处理"):
                 with gr.Row():
                     with gr.Column(scale=1):
-                        enable_preview = gr.Checkbox(label="启用音频预览（内置播放器）", value=False)
+                        enable_preview = gr.Checkbox(label="使用音频组件直接上传（适合小文件）", value=False)
+                        # 小文件模式
                         audio_preview = gr.Audio(label="选择音频文件", type="filepath", sources=["upload"], visible=True)
+                        # 大文件模式 (选择文件 + 只读试听)
                         audio_file_only = gr.File(label="选择音频文件", file_types=[".wav",".mp3",".m4a",".flac",".ogg"], visible=False)
+                        audio_listen = gr.Audio(label="🎧 试听（上传后可用）", type="filepath", interactive=False, visible=False)
 
-                        # 新增预处理开关
                         force_preprocess_check = gr.Checkbox(label="⚡ 强制预处理为 16kHz 单声道 (推荐)", value=True)
 
                         primary_text = gr.Textbox(label="主文稿（对齐用）", lines=18, placeholder="粘贴与音频内容一致的稿子...\n段落之间用空行分隔")
@@ -995,13 +1002,23 @@ def create_ui():
                 if not any_shown:
                     gr.Markdown("*帮助文件为空或缺失，请检查 help_content.json*")
 
+        # 双开关联动：小文件模式 → audio_preview 可见；大文件模式 → audio_file_only + audio_listen 可见
         def toggle_preview(enable):
-            return gr.update(visible=enable), gr.update(visible=not enable)
-        enable_preview.change(toggle_preview, inputs=enable_preview, outputs=[audio_preview, audio_file_only])
+            return (gr.update(visible=enable),                    # audio_preview
+                    gr.update(visible=not enable),                # audio_file_only
+                    gr.update(visible=not enable and False))      # audio_listen 初始不可见，需等上传后出现
+        enable_preview.change(toggle_preview, inputs=enable_preview, outputs=[audio_preview, audio_file_only, audio_listen])
 
-        def toggle_anchor_extras(anchor_enabled):
-            return gr.update(visible=anchor_enabled)
-        merge_anchor.change(toggle_anchor_extras, inputs=merge_anchor, outputs=extra_regex_box)
+        # 大文件上传后更新只读试听
+        def update_large_preview(file_obj):
+            if file_obj is None:
+                return gr.update(value=None, visible=False)
+            path = file_obj if isinstance(file_obj, str) else file_obj.name
+            return gr.update(value=path, visible=True)
+        audio_file_only.change(update_large_preview, inputs=audio_file_only, outputs=audio_listen)
+
+        # 锚点正则显示联动
+        merge_anchor.change(lambda x: gr.update(visible=x), inputs=merge_anchor, outputs=extra_regex_box)
 
         def run_alignment_with_audio_selection(
             preview_enabled, audio_p, audio_f, force_preprocess, primary_text, secondary_text,
@@ -1034,12 +1051,15 @@ def create_ui():
             outputs=[task_status, word_output, sent_output, merged_output, secondary_output, dual_output, anchor_output, system_status]
         )
 
+        def clear_all():
+            return (None, None, None, "", "", "", False, False, 3, "", True)
+
         clear_btn.click(
             clear_outputs,
             outputs=[task_status, word_output, sent_output, merged_output, secondary_output, dual_output, anchor_output, system_status]
         ).then(
-            lambda: [None, None, "", "", "", False, False, 3, "", True],
-            outputs=[audio_preview, audio_file_only, primary_text, secondary_text, secondary_lang,
+            clear_all,
+            outputs=[audio_preview, audio_file_only, audio_listen, primary_text, secondary_text, secondary_lang,
                      enable_dual, merge_anchor, anchor_char_count, extra_regex_box, force_preprocess_check]
         )
 
@@ -1088,7 +1108,7 @@ def main():
                 server_port=p,
                 inbrowser=True,
                 show_error=True,
-                max_file_size=500 * 1024 * 1024   # 与 whisperX 一致，500MB
+                max_file_size=500 * 1024 * 1024
             )
             break
         except OSError:
