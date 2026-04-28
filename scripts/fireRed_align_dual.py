@@ -13,6 +13,12 @@ FireRedASR2S 文稿对齐 + 双语字幕生成（锚点增强版）
 - 批量处理传递 secondary_lang
 - 双开关保留：大文件模式新增只读试听
 - 智能空格拼接（中英混合正确分隔）
+【本次重要修复】
+- 特征提取硬编码采样率修复，非预处理模式对齐正确
+- 智能空格逻辑纠正，中英文正确分隔
+- 句子超长合并规则修复
+- 时间戳单位判断增强
+- 手动模型加载/卸载/刷新，界面精简
 """
 
 import sys, os, re, time, json, gc, logging, threading, atexit, tempfile, shutil, subprocess
@@ -48,7 +54,6 @@ try:
     from fireredasr2s.fireredvad import FireRedVadConfig
     from fireredasr2s.fireredlid import FireRedLidConfig
     from fireredasr2s.fireredpunc import FireRedPuncConfig
-    FIRERED_AVAILABLE = True
 except ImportError as e:
     logger.error(f"导入 FireRedASR2S 失败: {e}")
     print("请确保 FireRedASR2S 模块已正确放置在 FireRedASR2S 目录下")
@@ -119,14 +124,15 @@ def _is_cjk_word(word: str) -> bool:
     return bool(re.search(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', word))
 
 def _smart_join(words: List[str]) -> str:
-    """根据相邻单词的语言类型自动添加空格"""
+    """根据相邻单词的语言类型自动添加空格（修复版）"""
     if not words:
         return ""
     parts = [words[0]]
     for i in range(1, len(words)):
-        prev_non_cjk = not _is_cjk_word(words[i-1])
-        curr_non_cjk = not _is_cjk_word(words[i])
-        if prev_non_cjk and curr_non_cjk:
+        prev_is_cjk = _is_cjk_word(words[i-1])
+        curr_is_cjk = _is_cjk_word(words[i])
+        # 只要不是两个都是 CJK，就需要空格分隔
+        if not (prev_is_cjk and curr_is_cjk):
             parts.append(" ")
         parts.append(words[i])
     return "".join(parts)
@@ -153,7 +159,8 @@ class FireRedAlignManager:
                 return str(p)
         return None
 
-    def load_system(self, use_gpu=True, use_half=False, model_dir_override=None):
+    def load_system(self, use_gpu=True, use_half=False):
+        """加载模型（不再接受外部模型目录，自动寻找）"""
         with self.lock:
             if self.asr_system is not None:
                 return True, "系统已加载"
@@ -167,12 +174,9 @@ class FireRedAlignManager:
                     "asr_model_type": "aed",
                 }
 
-                if model_dir_override and Path(model_dir_override).exists():
-                    model_dir = str(model_dir_override)
-                else:
-                    model_dir = self.find_model_dir()
-                    if not model_dir:
-                        return False, "未找到 AED 模型目录，请将模型放在 pretrained_models/FireRedASR2-AED 或指定路径"
+                model_dir = self.find_model_dir()
+                if not model_dir:
+                    return False, "未找到 AED 模型目录，请将模型放在 pretrained_models/FireRedASR2-AED"
 
                 vad_config = FireRedVadConfig(use_gpu=config["use_gpu"])
                 lid_config = FireRedLidConfig(use_gpu=config["use_gpu"])
@@ -302,7 +306,8 @@ class FireRedAlignManager:
         try:
             asr = self.asr_system.asr
 
-            feats, lengths, _, _, _ = asr.feat_extractor([(16000, waveform)], ["tmp"])
+            # 【修复1】使用实际采样率进行特征提取
+            feats, lengths, _, _, _ = asr.feat_extractor([(sr, waveform)], ["tmp"])
             if not isinstance(lengths, torch.Tensor):
                 lengths = torch.tensor(lengths, dtype=torch.long)
             else:
@@ -338,12 +343,8 @@ class FireRedAlignManager:
             if len(starts) == 0:
                 return None, None, None, None, "时间戳为空"
 
-            if max(starts) <= T * 1.2 and min(starts) >= -T * 0.2:
-                timestamps_sec = [(s * frame_shift, e * frame_shift) for s, e in zip(starts, ends)]
-            elif max(starts) < duration * 1000 * 1.5:
-                timestamps_sec = [(s / 1000, e / 1000) for s, e in zip(starts, ends)]
-            else:
-                timestamps_sec = list(zip(starts, ends))
+            # 直接使用帧索引转换为秒（不再猜测毫秒或秒，模型返回的就是帧索引）
+            timestamps_sec = [(s * frame_shift, e * frame_shift) for s, e in zip(starts, ends)]
 
             min_len = min(len(timestamps_sec), len(token_ids))
             timestamps_sec = timestamps_sec[:min_len]
@@ -402,6 +403,16 @@ def merge_timestamps_to_sentences(timestamps, words,
         if force_break_indices and i < len(force_break_indices) and force_break_indices[i]:
             should_break = True
         else:
+            # 【修复3】在添加单词前检查当前句子是否已达字符数上限
+            if merge_by_charcount and current_words:
+                if len(_smart_join(current_words)) >= max_chars:
+                    should_break = True
+            # 如果通过字符数未触发，再检查添加后是否会超限
+            if not should_break and merge_by_charcount and current_words:
+                test_text = _smart_join(current_words + [word])
+                if len(test_text) >= max_chars:
+                    should_break = True
+
             if merge_by_punc and any(word.endswith(p) for p in sentence_endings):
                 should_break = True
             if not should_break and merge_by_silence and i > 0:
@@ -410,11 +421,6 @@ def merge_timestamps_to_sentences(timestamps, words,
                     should_break = True
             if not should_break and merge_by_wordcount and len(current_words) + 1 >= max_words:
                 should_break = True
-            if not should_break and merge_by_charcount and current_words:
-                # 智能拼接后判断字符数
-                test_text = _smart_join(current_words + [word])
-                if len(test_text) >= max_chars:
-                    should_break = True
             if not should_break and merge_by_duration and current_words:
                 if (last_end - current_start) + (end - start) >= max_duration:
                     should_break = True
@@ -476,7 +482,6 @@ def anchor_align_segments(words, word_timestamps, force_break_indices, audio_dur
 
     result_sentences = []
     for idx, (seg_words, seg_ts) in enumerate(segments):
-        # 使用智能拼接代替简单 join
         seg_text = _smart_join(seg_words).strip()
         if not seg_text:
             continue
@@ -542,7 +547,6 @@ def safe_audio_path(audio_input) -> Optional[str]:
 
 def run_alignment(
     audio_file, primary_text, secondary_text, secondary_lang, enable_dual,
-    use_gpu, use_half, model_dir_override,
     merge_punctuations, merge_max_words, merge_max_chars, merge_max_duration,
     merge_silence_threshold, merge_by_punc, merge_by_silence, merge_by_wordcount,
     merge_by_charcount, merge_by_duration, merge_by_newline,
@@ -553,6 +557,8 @@ def run_alignment(
         return "错误: 请上传音频文件", "", "", "", "", "", "", get_system_status()
     if not primary_text or not primary_text.strip():
         return "错误: 请粘贴主文稿", "", "", "", "", "", "", get_system_status()
+    if manager.asr_system is None:
+        return "错误: 模型未加载，请先点击「加载模型」", "", "", "", "", "", "", get_system_status()
 
     if use_anchor:
         primary_text_cleaned = clean_text_for_anchor(primary_text, extra_regex)
@@ -563,12 +569,7 @@ def run_alignment(
     if not audio_path or not os.path.exists(audio_path):
         return "错误: 无法获取有效的音频文件路径", "", "", "", "", "", "", get_system_status()
 
-    progress(0.05, desc="加载模型...")
-    success, msg = manager.load_system(use_gpu, use_half, model_dir_override)
-    if not success:
-        return f"错误: {msg}", "", "", "", "", "", "", get_system_status()
-
-    progress(0.2, desc="强制对齐中...")
+    progress(0.05, desc="准备音频...")
     word_srt, sent_srt, timestamps, words, error = manager.force_align(audio_path, primary_text_cleaned,
                                                                        force_preprocess=force_preprocess)
     if error:
@@ -752,12 +753,8 @@ def run_alignment(
     progress(1.0, desc="完成")
     return status, word_srt, sent_srt, merged_srt, secondary_srt_str, dual_srt, anchor_srt, get_system_status()
 
-def clear_outputs():
-    return "等待开始", "", "", "", "", "", "", get_system_status()
-
 def batch_process(
     audio_files, text_files, enable_dual_batch, secondary_lang,
-    use_gpu, use_half, model_dir_override,
     merge_punctuations, merge_max_words, merge_max_chars, merge_max_duration,
     merge_silence_threshold, merge_by_punc, merge_by_silence, merge_by_wordcount,
     merge_by_charcount, merge_by_duration, merge_by_newline,
@@ -767,11 +764,8 @@ def batch_process(
         return "请上传音频文件和对应的文稿文件（数量相同，顺序对应）", get_system_status()
     if len(audio_files) != len(text_files):
         return f"音频文件数量 ({len(audio_files)}) 与文稿文件数量 ({len(text_files)}) 不一致", get_system_status()
-
-    progress(0.02, desc="加载模型...")
-    success, msg = manager.load_system(use_gpu, use_half, model_dir_override)
-    if not success:
-        return f"模型加载失败: {msg}", get_system_status()
+    if manager.asr_system is None:
+        return "模型未加载，请先点击「加载模型」", get_system_status()
 
     results = []
     total = len(audio_files)
@@ -909,9 +903,7 @@ def create_ui():
                 with gr.Row():
                     with gr.Column(scale=1):
                         enable_preview = gr.Checkbox(label="使用音频组件直接上传（适合小文件）", value=False)
-                        # 小文件模式
                         audio_preview = gr.Audio(label="选择音频文件", type="filepath", sources=["upload"], visible=True)
-                        # 大文件模式 (选择文件 + 只读试听)
                         audio_file_only = gr.File(label="选择音频文件", file_types=[".wav",".mp3",".m4a",".flac",".ogg"], visible=False)
                         audio_listen = gr.Audio(label="🎧 试听（上传后可用）", type="filepath", interactive=False, visible=False)
 
@@ -928,11 +920,14 @@ def create_ui():
                             system_status = gr.Textbox(label="系统状态", value=get_system_status(), lines=4, interactive=False, scale=1)
                             task_status = gr.Textbox(label="任务状态", value="等待开始", lines=4, interactive=False, scale=1)
 
-                        with gr.Accordion("⚙️ 模型设置", open=True):
+                        with gr.Accordion("⚙️ 模型控制", open=True):
                             with gr.Row():
                                 use_gpu = gr.Checkbox(label="使用 GPU", value=torch.cuda.is_available())
                                 use_half = gr.Checkbox(label="使用半精度 (FP16)", value=False)
-                            model_dir_override = gr.Textbox(label="模型目录（可选）", placeholder="留空自动检测")
+                            with gr.Row():
+                                load_model_btn = gr.Button("加载模型", variant="primary")
+                                unload_model_btn = gr.Button("卸载模型", variant="secondary")
+                                refresh_status_btn = gr.Button("刷新状态", variant="secondary")
 
                         with gr.Accordion("📝 字幕合并规则", open=True):
                             with gr.Row():
@@ -1002,14 +997,13 @@ def create_ui():
                 if not any_shown:
                     gr.Markdown("*帮助文件为空或缺失，请检查 help_content.json*")
 
-        # 双开关联动：小文件模式 → audio_preview 可见；大文件模式 → audio_file_only + audio_listen 可见
+        # 双开关联动
         def toggle_preview(enable):
-            return (gr.update(visible=enable),                    # audio_preview
-                    gr.update(visible=not enable),                # audio_file_only
-                    gr.update(visible=not enable and False))      # audio_listen 初始不可见，需等上传后出现
+            return (gr.update(visible=enable),
+                    gr.update(visible=not enable),
+                    gr.update(visible=not enable and False))
         enable_preview.change(toggle_preview, inputs=enable_preview, outputs=[audio_preview, audio_file_only, audio_listen])
 
-        # 大文件上传后更新只读试听
         def update_large_preview(file_obj):
             if file_obj is None:
                 return gr.update(value=None, visible=False)
@@ -1020,9 +1014,25 @@ def create_ui():
         # 锚点正则显示联动
         merge_anchor.change(lambda x: gr.update(visible=x), inputs=merge_anchor, outputs=extra_regex_box)
 
+        # 模型控制
+        def load_model_action(use_gpu, use_half):
+            success, msg = manager.load_system(use_gpu, use_half)
+            return msg, get_system_status()
+
+        def unload_model_action():
+            success, msg = manager.unload_system()
+            return msg, get_system_status()
+
+        def refresh_status_action():
+            return get_system_status()
+
+        load_model_btn.click(load_model_action, inputs=[use_gpu, use_half], outputs=[task_status, system_status])
+        unload_model_btn.click(unload_model_action, outputs=[task_status, system_status])
+        refresh_status_btn.click(refresh_status_action, outputs=[system_status])
+
         def run_alignment_with_audio_selection(
             preview_enabled, audio_p, audio_f, force_preprocess, primary_text, secondary_text,
-            secondary_lang, enable_dual, use_gpu, use_half, model_dir_override,
+            secondary_lang, enable_dual,
             punc_box, max_words_slider, max_chars_slider, max_duration_slider,
             silence_slider, merge_punc, merge_silence, merge_wordcount,
             merge_charcount, merge_duration, merge_newline, merge_anchor, anchor_char_count,
@@ -1031,8 +1041,8 @@ def create_ui():
             audio_input = audio_p if preview_enabled else audio_f
             return run_alignment(
                 audio_input, primary_text, secondary_text, secondary_lang, enable_dual,
-                use_gpu, use_half, model_dir_override, punc_box, max_words_slider, max_chars_slider,
-                max_duration_slider, silence_slider, merge_punc, merge_silence, merge_wordcount,
+                punc_box, max_words_slider, max_chars_slider, max_duration_slider,
+                silence_slider, merge_punc, merge_silence, merge_wordcount,
                 merge_charcount, merge_duration, merge_newline, merge_anchor, anchor_char_count,
                 extra_regex, force_preprocess, progress
             )
@@ -1042,7 +1052,6 @@ def create_ui():
             inputs=[
                 enable_preview, audio_preview, audio_file_only, force_preprocess_check,
                 primary_text, secondary_text, secondary_lang, enable_dual,
-                use_gpu, use_half, model_dir_override,
                 punc_box, max_words_slider, max_chars_slider, max_duration_slider,
                 silence_slider, merge_punc, merge_silence, merge_wordcount,
                 merge_charcount, merge_duration, merge_newline,
@@ -1052,22 +1061,21 @@ def create_ui():
         )
 
         def clear_all():
-            return (None, None, None, "", "", "", False, False, 3, "", True)
+            return (None, None, None, "", "", "", False, False, 3, "", True, False)
 
         clear_btn.click(
-            clear_outputs,
+            lambda: ("等待开始", "", "", "", "", "", "", get_system_status()),
             outputs=[task_status, word_output, sent_output, merged_output, secondary_output, dual_output, anchor_output, system_status]
         ).then(
             clear_all,
             outputs=[audio_preview, audio_file_only, audio_listen, primary_text, secondary_text, secondary_lang,
-                     enable_dual, merge_anchor, anchor_char_count, extra_regex_box, force_preprocess_check]
+                     enable_dual, merge_anchor, anchor_char_count, extra_regex_box, force_preprocess_check, enable_preview]
         )
 
         batch_run_btn.click(
             batch_process,
             inputs=[
                 audio_files, text_files, enable_dual_batch, secondary_lang_batch,
-                use_gpu, use_half, model_dir_override,
                 punc_box, max_words_slider, max_chars_slider, max_duration_slider,
                 silence_slider, merge_punc, merge_silence, merge_wordcount,
                 merge_charcount, merge_duration, merge_newline,
