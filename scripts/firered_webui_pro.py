@@ -2,11 +2,10 @@
 # -*- coding: utf-8 -*-
 """
 FireRedASR2S WebUI Professional Edition (增强融合版)
-- 基于 firered_webui_pro - 副本.py 的完整 UI 与功能
-- 融入修复版 (firered_webui_pro.py) 的核心逻辑改进
-- 新增：音频预处理开关（FFmpeg 16k mono 可选）
+- 新增：音频预处理开关（FFmpeg 16k mono 可选），失败自动降级
 - 新增：视频字幕合并参数面板
 - 优化：英文空格连接、强制对齐 token ID 匹配、去除调试打印
+- 修复：模型目录存在性检查、Gradio 兼容性、预处理回退
 - 扩展文件大小上限至 500MB
 Copyright 2026 光影的故事2018
 """
@@ -55,7 +54,7 @@ else:
     PROJECT_ROOT = CURRENT_DIR
 sys.path.insert(0, str(PROJECT_ROOT / "FireRedASR2S"))
 
-# ==================== 导入检查 ====================
+# ==================== 导入检查（已修复：将实际导入放入 try 块）====================
 FIRERED_AVAILABLE = False
 try:
     from fireredasr2s import FireRedAsr2System, FireRedAsr2SystemConfig
@@ -181,6 +180,24 @@ class FireRedASR2SManager:
                 if not model_dir or not Path(model_dir).exists():
                     return False, f"模型目录不存在，请将模型放置在 pretrained_models/FireRedASR2-AED 等目录"
 
+                # ---------- 修复1：检查子模型目录是否存在 ----------
+                vad_model_dir = str(ROOT_DIR / "pretrained_models" / "FireRedVAD" / "vad")
+                if not os.path.exists(vad_model_dir):
+                    alt_vad_dir = str(ROOT_DIR / "pretrained_models" / "FireRedVAD" / "VAD")
+                    if os.path.exists(alt_vad_dir):
+                        vad_model_dir = alt_vad_dir
+                    else:
+                        return False, f"VAD 模型目录不存在: {vad_model_dir} 或 {alt_vad_dir}"
+
+                lid_model_dir = str(ROOT_DIR / "pretrained_models" / "FireRedLID")
+                if not os.path.exists(lid_model_dir):
+                    return False, f"LID 模型目录不存在: {lid_model_dir}"
+
+                punc_model_dir = str(ROOT_DIR / "pretrained_models" / "FireRedPunc")
+                if not os.path.exists(punc_model_dir):
+                    return False, f"标点模型目录不存在: {punc_model_dir}"
+
+                # ---------- 构建配置 ----------
                 vad_config = FireRedVadConfig(use_gpu=default_config["use_gpu"])
                 lid_config = FireRedLidConfig(use_gpu=default_config["use_gpu"])
                 asr_config = FireRedAsr2Config(
@@ -221,17 +238,11 @@ class FireRedASR2SManager:
                         except:
                             pass
 
-                vad_model_dir = str(ROOT_DIR / "pretrained_models" / "FireRedVAD" / "vad")
-                if not os.path.exists(vad_model_dir):
-                    alt_vad_dir = str(ROOT_DIR / "pretrained_models" / "FireRedVAD" / "VAD")
-                    if os.path.exists(alt_vad_dir):
-                        vad_model_dir = alt_vad_dir
-
                 system_config = FireRedAsr2SystemConfig(
                     vad_model_dir=vad_model_dir,
-                    lid_model_dir=str(ROOT_DIR / "pretrained_models" / "FireRedLID"),
+                    lid_model_dir=lid_model_dir,
                     asr_model_dir=str(model_dir),
-                    punc_model_dir=str(ROOT_DIR / "pretrained_models" / "FireRedPunc"),
+                    punc_model_dir=punc_model_dir,
                     vad_config=vad_config,
                     lid_config=lid_config,
                     asr_config=asr_config,
@@ -261,7 +272,6 @@ class FireRedASR2SManager:
             return True, "系统已卸载"
 
     def transcribe(self, audio_input, force_preprocess=True):
-        """识别音频，force_preprocess 控制是否强制 16k mono"""
         if self.asr_system is None:
             return None, None, "系统未加载，请先加载模型"
         audio_path = self._prepare_audio(audio_input, force_preprocess=force_preprocess)
@@ -280,9 +290,12 @@ class FireRedASR2SManager:
                     pass
             return None, None, f"识别失败: {str(e)}"
 
-    # 修复 Bug 4：异常时根据 return_waveform 返回正确数量的 None
+    # ---------- 修复2：预处理失败时自动降级 ----------
     def _prepare_audio(self, audio_input, force_preprocess=True, return_waveform=False):
-        """使用 FFmpeg 预处理为 16k 单声道 wav，可选关闭强制预处理"""
+        """
+        使用 FFmpeg 预处理为 16k 单声道 wav，可选关闭强制预处理。
+        当 FFmpeg 失败时，自动回退到 librosa 重采样。
+        """
         try:
             if isinstance(audio_input, str) and os.path.exists(audio_input):
                 input_path = audio_input
@@ -305,21 +318,38 @@ class FireRedASR2SManager:
                     return input_path, data, sr
                 return input_path
 
-            # 用 FFmpeg 生成标准化的临时文件
-            with tempfile.NamedTemporaryFile(delete=False, suffix="_16k_mono.wav") as tmp_out:
-                out_path = tmp_out.name
-            cmd = [
-                FFMPEG_PATH, "-y", "-i", input_path,
-                "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", out_path
-            ]
-            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            self.temp_files.append(out_path)
+            # 尝试 FFmpeg 预处理
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix="_16k_mono.wav") as tmp_out:
+                    out_path = tmp_out.name
+                cmd = [
+                    FFMPEG_PATH, "-y", "-i", input_path,
+                    "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", out_path
+                ]
+                subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                self.temp_files.append(out_path)
 
-            if return_waveform:
-                data, sr = sf.read(out_path, dtype='float32')
-                return out_path, data, sr
-            else:
-                return out_path
+                if return_waveform:
+                    data, sr = sf.read(out_path, dtype='float32')
+                    return out_path, data, sr
+                else:
+                    return out_path
+
+            except Exception as e:
+                logging.warning(f"FFmpeg 预处理失败，回退到 librosa 重采样: {e}")
+                # 降级：用 librosa 加载并重采样到 16kHz 单声道
+                data, sr = librosa.load(input_path, sr=16000, mono=True)
+                # 生成临时 wav
+                with tempfile.NamedTemporaryFile(delete=False, suffix="_16k_mono.wav") as tmp_out:
+                    out_path = tmp_out.name
+                sf.write(out_path, data.astype(np.float32), 16000)
+                self.temp_files.append(out_path)
+
+                if return_waveform:
+                    return out_path, data, 16000
+                else:
+                    return out_path
+
         except Exception as e:
             logging.error(f"音频预处理失败: {e}")
             if return_waveform:
@@ -585,11 +615,9 @@ def merge_timestamps_to_sentences(timestamps, words,
     current_start = timestamps[0][0]
     current_words = []
     last_end = timestamps[0][1]
-    current_text = ""
 
     for i, ((start, end), word) in enumerate(zip(timestamps, words)):
         should_break = False
-
         if force_break_indices and i < len(force_break_indices) and force_break_indices[i]:
             should_break = True
         else:
@@ -1114,11 +1142,13 @@ def force_align_wrapper(audio, text, asr_model_type, use_gpu, use_half,
         with open(merged_path, "w", encoding="utf-8") as f:
             f.write(merged_srt)
 
+    # ---------- 修复3：兼容旧版 Gradio ----------
     if merge_warnings:
         try:
             gr.Warning("\n".join(merge_warnings))
         except:
-            pass
+            # 旧版 Gradio 不支持 gr.Warning，降级为打印
+            print("对齐警告:", "\n".join(merge_warnings))
 
     progress(0.9, desc="清理...")
     manager.cleanup_temp()
@@ -1283,7 +1313,7 @@ def create_interface():
                             visible=False
                         )
 
-                        force_preprocess_audio = gr.Checkbox(label="⚡ 强制预处理为 16kHz 单声道 (推荐)", value=True)
+                        force_preprocess_audio = gr.Checkbox(label="⚡ 强制预处理为 16kHz 单声道 (推荐，失败自动降级)", value=True)
 
                         # 字幕合并参数
                         with gr.Accordion("字幕合并参数", open=True):
@@ -1330,9 +1360,11 @@ def create_interface():
                     outputs=[text_output, json_output, srt_output]
                 ).then(refresh_status, outputs=[status_display])
 
+                # 修复清空按钮：重置所有音频输入控件
                 clear_btn.click(
-                    lambda: [None, "", "", ""],
-                    outputs=[audio_file, text_output, json_output, srt_output]
+                    lambda: [None, None, True, "文件上传（推荐大文件）", "", "", ""],
+                    outputs=[audio_file, audio_mic, force_preprocess_audio, input_mode,
+                             text_output, json_output, srt_output]
                 )
 
             # ---------- 视频字幕（移除 subtitle_mode） ----------
@@ -1347,8 +1379,8 @@ def create_interface():
                         )
                         force_preprocess_video = gr.Checkbox(label="⚡ 强制预处理音频 (推荐)", value=True)
 
-                        # 字幕合并参数
-                        with gr.Accordion("字幕合并参数", open=True):
+                        # 字幕合并参数（视频专属，便于保存独立设置）
+                        with gr.Accordion("视频字幕合并参数", open=True):
                             video_merge_max_duration = gr.Slider(1.0, 20.0, 10.0, step=0.5, label="单条最大时长 (秒)")
                             video_merge_max_chars = gr.Slider(5, 100, 30, step=5, label="单条最大字符数")
                             video_merge_punctuations = gr.Textbox(value="。！？.!?", label="句末标点")
@@ -1548,7 +1580,7 @@ def create_interface():
                     outputs=[config_status, system_info_text]
                 )
 
-                # 修复 Bug 5：使用跨平台函数
+                # 修复跨平台
                 def open_output():
                     open_file_or_dir(str(OUTPUT_DIR))
                     return "已打开输出目录"
@@ -1564,7 +1596,7 @@ def create_interface():
                     return f"清理了 {cleaned} 个临时文件"
                 clear_cache_btn.click(clear_cache, outputs=[config_status])
 
-                # 保存当前配置（增加 merge_punctuations_align 的保存）
+                # 保存当前配置（包含视频字幕页的独立参数）
                 def save_current_config():
                     config = {
                         "asr_model_type": asr_model_type.value,
@@ -1586,10 +1618,10 @@ def create_interface():
                         "vad_speech_threshold": vad_speech_threshold.value,
                         "vad_smooth_window_size": vad_smooth_window_size.value,
                         "punc_threshold": punc_threshold.value,
-                        "merge_punctuations": merge_punctuations.value,        # 音频识别页
-                        "merge_punctuations_align": merge_punctuations_align.value,  # 强制对齐页
+                        "merge_punctuations": merge_punctuations.value,
+                        "merge_punctuations_align": merge_punctuations_align.value,
                         "merge_max_words": align_max_words.value,
-                        "merge_max_chars": align_max_chars.value,
+                        "merge_max_chars": align_max_chars.value,      # 对齐页的字符数（视频页也有独立参数）
                         "merge_max_duration": align_max_duration.value,
                         "merge_silence_threshold": align_silence_threshold.value,
                         "merge_by_punc": merge_by_punc.value,
@@ -1599,6 +1631,11 @@ def create_interface():
                         "merge_by_duration": merge_by_duration.value,
                         "merge_by_newline": merge_by_newline.value,
                         "preview_max_size_mb": preview_max_size.value,
+                        # 视频字幕独立参数
+                        "video_merge_max_duration": video_merge_max_duration.value,
+                        "video_merge_max_chars": video_merge_max_chars.value,
+                        "video_merge_punctuations": video_merge_punctuations.value,
+                        "video_merge_silence_threshold": video_merge_silence_threshold.value,
                     }
                     timestamp = time.strftime("%Y%m%d_%H%M%S")
                     preset_path = PRESET_DIR / f"preset_{timestamp}.json"
@@ -1617,14 +1654,14 @@ def create_interface():
                 refresh_preset_btn.click(refresh_preset_list, outputs=[preset_selector])
 
                 # 加载所选配置（动态更新，匹配 components 列表长度）
-                # 注意：输出列表顺序与下方 keys 严格对应
                 _PARAM_KEYS = [
                     "asr_model_type", "use_gpu", "use_half", "enable_vad", "enable_lid", "enable_punc",
                     "beam_size", "nbest", "decode_max_len", "softmax_smoothing", "aed_length_penalty", "eos_penalty", "elm_weight",
                     "vad_min_speech_frame", "vad_max_speech_frame", "vad_min_silence_frame", "vad_speech_threshold", "vad_smooth_window_size", "punc_threshold",
                     "merge_punctuations", "merge_max_words", "merge_max_chars", "merge_max_duration", "merge_silence_threshold",
                     "merge_by_punc", "merge_by_silence", "merge_by_wordcount", "merge_by_charcount", "merge_by_duration", "merge_by_newline",
-                    "preview_max_size_mb", "merge_punctuations_align"
+                    "preview_max_size_mb", "merge_punctuations_align",
+                    "video_merge_max_duration", "video_merge_max_chars", "video_merge_punctuations", "video_merge_silence_threshold"
                 ]
                 _PARAM_DEFAULTS = {
                     "asr_model_type": "aed", "use_gpu": True, "use_half": False, "enable_vad": True, "enable_lid": True, "enable_punc": True,
@@ -1632,7 +1669,8 @@ def create_interface():
                     "vad_min_speech_frame": 20, "vad_max_speech_frame": 2000, "vad_min_silence_frame": 20, "vad_speech_threshold": 0.4, "vad_smooth_window_size": 5, "punc_threshold": 0.45,
                     "merge_punctuations": "。！？.!?", "merge_max_words": 20, "merge_max_chars": 30, "merge_max_duration": 10.0, "merge_silence_threshold": 0.3,
                     "merge_by_punc": True, "merge_by_silence": True, "merge_by_wordcount": True, "merge_by_charcount": True, "merge_by_duration": True, "merge_by_newline": False,
-                    "preview_max_size_mb": 5, "merge_punctuations_align": "。！？.!?"
+                    "preview_max_size_mb": 5, "merge_punctuations_align": "。！？.!?",
+                    "video_merge_max_duration": 10.0, "video_merge_max_chars": 30, "video_merge_punctuations": "。！？.!?", "video_merge_silence_threshold": 0.3
                 }
 
                 def load_selected_config(filename):
@@ -1662,7 +1700,8 @@ def create_interface():
                         vad_min_speech_frame, vad_max_speech_frame, vad_min_silence_frame, vad_speech_threshold, vad_smooth_window_size, punc_threshold,
                         merge_punctuations, align_max_words, align_max_chars, align_max_duration, align_silence_threshold,
                         merge_by_punc, merge_by_silence, merge_by_wordcount, merge_by_charcount, merge_by_duration, merge_by_newline,
-                        preview_max_size, merge_punctuations_align
+                        preview_max_size, merge_punctuations_align,
+                        video_merge_max_duration, video_merge_max_chars, video_merge_punctuations, video_merge_silence_threshold
                     ]
                 )
 
