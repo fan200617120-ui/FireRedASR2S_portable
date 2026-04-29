@@ -96,7 +96,7 @@ class FireRedAlignManager:
         self.asr_system = None
         self.config = None
         self.lock = threading.RLock()
-        self.temp_files = []          # 仅存放本次会话产生的临时文件（非缓存）
+        self.temp_files = []
         self.model_dir = None
 
     def find_model_dir(self, preferred_type="AED"):
@@ -126,7 +126,7 @@ class FireRedAlignManager:
                     "asr_model_type": "aed",
                 }
 
-                # 处理空字符串或 None，避免路径错误
+                # 处理空字符串或 None
                 if model_dir_override and Path(model_dir_override).exists():
                     model_dir = str(model_dir_override)
                     logger.info(f"使用指定模型目录: {model_dir}")
@@ -144,7 +144,6 @@ class FireRedAlignManager:
                 )
                 punc_config = FireRedPuncConfig(use_gpu=config["use_gpu"])
 
-                # 查找 VAD 模型目录
                 vad_model_dir = str(ROOT_DIR / "pretrained_models" / "FireRedVAD" / "vad")
                 if not os.path.exists(vad_model_dir):
                     alt_vad_dir = str(ROOT_DIR / "pretrained_models" / "FireRedVAD" / "VAD")
@@ -191,10 +190,6 @@ class FireRedAlignManager:
             return True, "系统已卸载"
 
     def _prepare_audio(self, audio_input, force_preprocess=False):
-        """处理音频，返回 (path, waveform, sr) 或 None。
-        预处理文件缓存至 CACHE_DIR，不自动删除。
-        """
-        # 解析路径
         if isinstance(audio_input, str):
             audio_path = audio_input
         elif isinstance(audio_input, tuple) and len(audio_input) > 0:
@@ -207,10 +202,8 @@ class FireRedAlignManager:
             logger.error(f"音频文件不存在: {audio_path}")
             return None
 
-        # 预处理分支
         if force_preprocess and FFMPEG_PATH != "ffmpeg":
             try:
-                # 基于文件前 4096 字节哈希生成缓存名
                 with open(audio_path, 'rb') as f:
                     file_hash = hashlib.md5(f.read(4096)).hexdigest()
             except Exception:
@@ -230,7 +223,6 @@ class FireRedAlignManager:
                 except subprocess.CalledProcessError as e:
                     err = e.stderr.decode(errors="ignore")[:200] if e.stderr else ""
                     logger.error(f"FFmpeg 预处理失败: {err}")
-                    # 删除残留文件并回退
                     if cache_path.exists():
                         cache_path.unlink()
                     force_preprocess = False
@@ -245,7 +237,6 @@ class FireRedAlignManager:
                     logger.error(f"读取缓存文件失败: {e}，回退 librosa")
                     force_preprocess = False
 
-        # 直接 librosa 加载
         try:
             data, sr = librosa.load(audio_path, sr=None)
             if sr != 16000:
@@ -257,7 +248,6 @@ class FireRedAlignManager:
             return None
 
     def cleanup_temp(self):
-        """仅清理本次会话产生的临时文件（非缓存）"""
         cleaned = 0
         for f in self.temp_files[:]:
             try:
@@ -419,23 +409,18 @@ def merge_timestamps_to_sentences(timestamps, words,
     last_end = timestamps[0][1]
 
     for i, ((start, end), word) in enumerate(zip(timestamps, words)):
-        # 基于当前句子（不含当前词）的状态检查提前断句
         break_current = False
         if current_words:
-            # 静音断句
             if merge_by_silence and i > 0:
                 gap = start - last_end
                 if gap > silence_threshold:
                     break_current = True
-            # 词数上限：当前句子词数已达上限，当前词不能加入
             if not break_current and merge_by_wordcount and len(current_words) >= max_words:
                 break_current = True
-            # 字符数上限
             if not break_current and merge_by_charcount:
                 current_chars = sum(len(w) for w in current_words)
                 if current_chars + len(word) > max_chars:
                     break_current = True
-            # 时长上限
             if not break_current and merge_by_duration:
                 current_dur = last_end - current_start
                 if current_dur + (end - start) >= max_duration:
@@ -449,15 +434,12 @@ def merge_timestamps_to_sentences(timestamps, words,
             })
             current_start = start
             current_words = []
-            # last_end 将在添加当前词后更新
 
-        # 添加当前词
         if not current_words:
             current_start = start
         current_words.append(word)
         last_end = end
 
-        # 词后的断句条件：强制索引、标点
         should_break_after = False
         if force_break_indices and i < len(force_break_indices) and force_break_indices[i]:
             should_break_after = True
@@ -473,7 +455,6 @@ def merge_timestamps_to_sentences(timestamps, words,
             current_start = None
             current_words = []
 
-    # 处理剩余词
     if current_words:
         sentences.append({
             "start": current_start,
@@ -488,10 +469,19 @@ def clean_text_for_anchor(text: str) -> str:
     text = re.sub(r' +', ' ', text)
     return text
 
-def anchor_align_segments(words, word_timestamps, force_break_indices, audio_duration, anchor_char_count=3):
-    """修复版锚点增强：结束时间使用本段最后词的时间，锚点取前 N 个汉字时间的平均值"""
+def anchor_align_segments(words, word_timestamps, force_break_indices, audio_duration,
+                          anchor_char_count=3,
+                          use_anchor_start=False, use_anchor_end=False, use_anchor_mean=False):
+    """
+    灵活锚点增强：
+    - use_anchor_start: 段落开始时间取前 anchor_char_count 个汉字的开始时间均值
+    - use_anchor_end:   段落结束时间取后 anchor_char_count 个汉字的结束时间均值
+    - use_anchor_mean:  开始/结束时间取前后锚点的均值（优先级高于单独启用的前/后锚点）
+    未开启任何锚点或段落无汉字时回退到原始词边界。
+    """
     if not words or not word_timestamps:
         return []
+
     # 按 force_break 切分段落
     segments = []
     cur_words = []
@@ -507,24 +497,51 @@ def anchor_align_segments(words, word_timestamps, force_break_indices, audio_dur
         segments.append((cur_words, cur_ts))
 
     result_sentences = []
-    for idx, (seg_words, seg_ts) in enumerate(segments):
+    for seg_words, seg_ts in segments:
         seg_text = "".join(seg_words).strip()
         if not seg_text:
             continue
-        # 寻找汉字索引
+
         chinese_indices = [i for i, w in enumerate(seg_words) if re.search(r'[\u4e00-\u9fff]', w)]
+        start_default = seg_ts[0][0]
+        end_default = seg_ts[-1][1]
+
+        # 前锚点（段落首部的汉字）
         if chinese_indices:
-            # 取前 anchor_char_count 个汉字的时间戳开始时间的平均值，作为段开始
-            n = min(anchor_char_count, len(chinese_indices))
-            anchor_idx = chinese_indices[:n]
-            seg_start = sum(seg_ts[i][0] for i in anchor_idx) / n
+            n_front = min(anchor_char_count, len(chinese_indices))
+            front_idx = chinese_indices[:n_front]
+            start_front = sum(seg_ts[i][0] for i in front_idx) / n_front
+            end_front = sum(seg_ts[i][1] for i in front_idx) / n_front
         else:
-            seg_start = seg_ts[0][0]
+            start_front = start_default
+            end_front = end_default
 
-        # 结束时间为该段最后一个词的时间戳结束值（修复之前使用下一段开始的错误）
-        seg_end = seg_ts[-1][1]
+        # 后锚点（段落尾部的汉字）
+        if chinese_indices:
+            n_back = min(anchor_char_count, len(chinese_indices))
+            back_idx = chinese_indices[-n_back:]
+            start_back = sum(seg_ts[i][0] for i in back_idx) / n_back
+            end_back = sum(seg_ts[i][1] for i in back_idx) / n_back
+        else:
+            start_back = start_default
+            end_back = end_default
 
-        # 防止结束时间早于开始时间
+        # 开始时间决策
+        if use_anchor_mean:
+            seg_start = (start_front + start_back) / 2
+        elif use_anchor_start:
+            seg_start = start_front
+        else:
+            seg_start = start_default
+
+        # 结束时间决策
+        if use_anchor_mean:
+            seg_end = (end_front + end_back) / 2
+        elif use_anchor_end:
+            seg_end = end_back
+        else:
+            seg_end = end_default
+
         if seg_end <= seg_start:
             seg_end = seg_start + 0.5
 
@@ -571,7 +588,7 @@ def run_alignment(
     merge_punctuations, merge_max_words, merge_max_chars, merge_max_duration,
     merge_silence_threshold, merge_by_punc, merge_by_silence, merge_by_wordcount,
     merge_by_charcount, merge_by_duration, merge_by_newline,
-    use_anchor, anchor_char_count,
+    use_anchor_start, use_anchor_end, use_anchor_mean, anchor_char_count,
     force_preprocess,
     progress=gr.Progress()
 ):
@@ -580,7 +597,8 @@ def run_alignment(
     if not primary_text or not primary_text.strip():
         return "错误: 请粘贴主文稿", "", "", "", "", "", "", get_system_status()
 
-    if use_anchor:
+    anchor_enabled = use_anchor_start or use_anchor_end or use_anchor_mean
+    if anchor_enabled:
         primary_text_cleaned = clean_text_for_anchor(primary_text)
     else:
         primary_text_cleaned = primary_text
@@ -671,7 +689,6 @@ def run_alignment(
                     if 0 <= tidx < len(words):
                         force_break_punc[tidx] = True
 
-    # 合并强制断句索引
     final_force_break = None
     if force_break is not None or force_break_punc is not None:
         final_force_break = [False] * len(words)
@@ -690,7 +707,7 @@ def run_alignment(
         max_chars=merge_max_chars,
         max_duration=merge_max_duration,
         silence_threshold=merge_silence_threshold,
-        merge_by_punc=False,   # 已在 final_force_break 中合并标点
+        merge_by_punc=False,
         merge_by_silence=merge_by_silence,
         merge_by_wordcount=merge_by_wordcount,
         merge_by_charcount=merge_by_charcount,
@@ -700,11 +717,15 @@ def run_alignment(
     merged_srt = sentences_to_srt(sentences)
 
     anchor_srt = ""
-    if use_anchor and final_force_break and words and timestamps:
+    if anchor_enabled and final_force_break and words and timestamps:
         audio_duration = timestamps[-1][1] + 0.5 if timestamps else 0.0
-        # 使用修复版锚点增强，anchor_char_count 参数生效
-        anchor_sentences = anchor_align_segments(words, timestamps, final_force_break, audio_duration,
-                                                 anchor_char_count=anchor_char_count)
+        anchor_sentences = anchor_align_segments(
+            words, timestamps, final_force_break, audio_duration,
+            anchor_char_count=anchor_char_count,
+            use_anchor_start=use_anchor_start,
+            use_anchor_end=use_anchor_end,
+            use_anchor_mean=use_anchor_mean
+        )
         anchor_srt = sentences_to_srt(anchor_sentences)
 
     dual_srt = ""
@@ -786,7 +807,6 @@ def run_alignment(
     manager.cleanup_temp()
     progress(1.0, desc="完成")
 
-    # 返回值缩减为 8 个，不再包含下载文件路径
     return (
         safe_preview(status, 5000),
         safe_preview(word_srt),
@@ -849,7 +869,6 @@ def batch_process(
             results.append(f"❌ {os.path.basename(audio_path)}: 未获取到有效时间戳")
             continue
 
-        # 批量模式下同样应用断句规则，但不支持锚点增强和双语（UI 已禁用）
         asr = manager.asr_system.asr
         force_break = None
         if merge_by_newline and words:
@@ -934,13 +953,12 @@ def batch_process(
 
 # ==================== 创建 UI ====================
 def create_ui():
-    help_data = {"single": "", "batch": "", "merge_rules": "", "model_path": "", "output": ""}
+    help_data = {}
     help_file = Path(__file__).parent / "help_content.json"
     if help_file.exists():
         try:
             with open(help_file, 'r', encoding='utf-8') as f:
-                loaded = json.load(f)
-                help_data.update(loaded)
+                help_data = json.load(f)
         except Exception as e:
             logger.warning(f"加载帮助文件失败: {e}")
 
@@ -992,8 +1010,13 @@ def create_ui():
                                 max_chars_slider = gr.Slider(label="最大字符数", minimum=5, maximum=100, value=30, step=5)
                                 max_duration_slider = gr.Slider(label="最大时长 (秒)", minimum=1.0, maximum=20.0, value=10.0, step=0.5)
                             with gr.Row():
-                                merge_anchor = gr.Checkbox(label="启用锚点增强（以空行为主，前几字定位）", value=False)
-                                anchor_char_count = gr.Slider(1, 10, value=3, step=1, label="锚点参考汉字数")
+                                gr.Markdown("**锚点增强选项**（需先启用空行分段）")
+                            with gr.Row():
+                                use_anchor_start = gr.Checkbox(label="前锚点", value=False, info="段落开头取前几个汉字校准开始时间")
+                                use_anchor_end = gr.Checkbox(label="后锚点", value=False, info="段落结尾取后几个汉字校准结束时间")
+                                use_anchor_mean = gr.Checkbox(label="前后均值", value=False, info="开始/结束取前后锚点的平均值，覆盖单独选项")
+                            with gr.Row():
+                                anchor_char_count = gr.Slider(1, 5, value=3, step=1, label="锚点参考汉字数")
 
                         with gr.Row():
                             run_btn = gr.Button("开始对齐", variant="primary", size="lg")
@@ -1027,22 +1050,12 @@ def create_ui():
                         batch_system = gr.Textbox(label="系统状态", value=get_system_status(), lines=4, interactive=False)
                         batch_run_btn = gr.Button("开始批量对齐", variant="primary", size="lg")
 
-            
             # ---------- 帮助 ----------
             with gr.Tab("帮助"):
-                if help_file.exists():
-                    try:
-                        with open(help_file, 'r', encoding='utf-8') as f:
-                            help_dict = json.load(f)
-                        if help_dict:
-                            for section, content in help_dict.items():
-                                if content and isinstance(content, str):
-                                    gr.Markdown(f"## {section}\n\n{content}")
-                        else:
-                            gr.Markdown("外挂帮助文件为空，请联系开发者。")
-                    except Exception as e:
-                        logger.error(f"帮助文件加载失败: {e}")
-                        gr.Markdown("帮助文件加载失败，请检查 `scripts/help_content.json`。")
+                if help_file.exists() and help_data:
+                    for section, content in help_data.items():
+                        if content and isinstance(content, str):
+                            gr.Markdown(f"## {section}\n\n{content}")
                 else:
                     gr.Markdown("""
                     ## 使用说明
@@ -1070,7 +1083,6 @@ def create_ui():
         unload_model_btn.click(unload_model_action, outputs=[task_status, system_status])
         refresh_status_btn.click(refresh_status_action, outputs=[system_status])
 
-        # 单次处理：输出仅 8 个组件，无下载文件
         run_btn.click(
             run_alignment,
             inputs=[
@@ -1079,7 +1091,7 @@ def create_ui():
                 punc_box, max_words_slider, max_chars_slider, max_duration_slider,
                 silence_slider, merge_punc, merge_silence, merge_wordcount,
                 merge_charcount, merge_duration, merge_newline,
-                merge_anchor, anchor_char_count,
+                use_anchor_start, use_anchor_end, use_anchor_mean, anchor_char_count,
                 force_preprocess_check
             ],
             outputs=[task_status, word_output, sent_output, merged_output,
@@ -1091,12 +1103,12 @@ def create_ui():
             outputs=[task_status, word_output, sent_output, merged_output,
                      secondary_output, dual_output, anchor_output, system_status]
         ).then(
-            lambda: [None, "", "", "", False, False, 3, True],
+            lambda: [None, "", "", "", False, False, False, False, 3, True],
             outputs=[audio_input, primary_text, secondary_text, secondary_lang,
-                     enable_dual, merge_anchor, anchor_char_count, force_preprocess_check]
+                     enable_dual, use_anchor_start, use_anchor_end, use_anchor_mean,
+                     anchor_char_count, force_preprocess_check]
         )
 
-        # 打开输出目录
         def open_output_dir():
             if sys.platform == "win32":
                 os.startfile(str(OUTPUT_DIR))
