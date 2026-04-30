@@ -1,9 +1,34 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-字幕清洗工具 - 自定义版
+FireRedASR2S WebUI Professional Edition
+Copyright 2026 光影的故事2018
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+字幕清洗工具 - 自定义版（已修复全部已知bug）
 功能：去除语气词、重复词，支持自定义词库（可保存/加载TXT）
 输出目录：根目录下的 output/字幕清洗
+
+修复内容：
+1. 激进模式正则匹配失效 → 使用标点/空格边界安全删除语气词
+2. SRT解析吞下一段序号 → 增强文本块结束判断
+3. 文本粘贴SRT检测过于简单 → 使用时间轴正则检测
+4. 加载词库文件意外清空 → 无文件或出错时保持原内容不变
+5. 临时文件无清理 → 下载文件统一存放到输出目录
+6. 多行字幕丢失原格式 → 每行分别清洗后保留换行
+7. 编码硬编码UTF-8 → 自动尝试常见中文编码
+8. 开头/结尾语气词只删一个 → 循环删除直到干净
 """
 
 import os
@@ -15,20 +40,16 @@ from pathlib import Path
 import gradio as gr
 
 # ==================== 路径设置 ====================
-# 脚本所在目录: F:\FireRedASR2S_portable_win\scripts
 SCRIPT_DIR = Path(__file__).parent.absolute()
-# 项目根目录: F:\FireRedASR2S_portable_win
 ROOT_DIR = SCRIPT_DIR.parent
-# 输出目录: 根目录/output/字幕清洗
 OUTPUT_DIR = ROOT_DIR / "output" / "字幕清洗"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# 默认自定义词库文件路径（放在 scripts 目录下，方便管理）
 DEFAULT_CUSTOM_WORDS_PATH = SCRIPT_DIR / "custom_words.txt"
 
 # 内置语气词库
 DEFAULT_FILLER_WORDS = {
-    "啊", "呀", "呢", "吧", "吗", "嘛", "噢", "哦", "哟", "咳", "唉", 
+    "啊", "呀", "呢", "吧", "吗", "嘛", "噢", "哦", "哟", "咳", "唉",
     "嗨", "嘿", "喂", "嗯", "呃", "哎", "喔", "呵", "哈", "嘻", "哼",
     "哇", "呐", "咯", "哩", "咧", "啦", "啰", "喽",
     "哎呀", "哎哟", "哎呦", "啊呀", "啊哟", "啊哈", "嗯哼", "呃呃", "哎哎",
@@ -39,6 +60,25 @@ DEFAULT_FILLER_WORDS = {
     "就是说", "我们说", "可以说", "换句话说", "也就是说", "大家知道",
     "我们知道", "应该说", "老实说", "说实话", "坦率地说",
 }
+
+
+def safe_read_file(file_path, encodings=('utf-8', 'gbk', 'gb2312', 'latin-1')):
+    """尝试多种编码读取文件，解决编码硬编码问题"""
+    for enc in encodings:
+        try:
+            with open(file_path, 'r', encoding=enc) as f:
+                return f.read()
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    raise ValueError(f"无法识别文件编码，已尝试: {encodings}")
+
+
+def is_srt_content(text):
+    """使用时间轴正则严格检测SRT格式（修复bug3）"""
+    # 匹配典型时间轴行：00:00:01,000 --> 00:00:04,000
+    pattern = r'\d+:\d{2}:\d{2}[.,]\d{3}\s*-->\s*\d+:\d{2}:\d{2}[.,]\d{3}'
+    return bool(re.search(pattern, text))
+
 
 class SubtitleCleaner:
     def __init__(self):
@@ -58,62 +98,88 @@ class SubtitleCleaner:
         return self.filler_words.union(self.custom_words)
 
     def clean_text(self, text, aggressive=True):
-        """清洗单行文本"""
+        """清洗单行文本（修复开头/结尾循环删除，激进模式安全删除）"""
         if not text:
             return text
-        original = text
+        original = text.strip()
         all_fillers = self.get_all_fillers()
         sorted_fillers = sorted(all_fillers, key=len, reverse=True)
 
-        # 去除开头语气词
-        for filler in sorted_fillers:
-            if original.startswith(filler):
-                original = original[len(filler):].lstrip()
-                if original and original[0] in "，、；：":
-                    original = original[1:].lstrip()
-                break
-
-        # 去除结尾语气词
-        for filler in sorted_fillers:
-            if original.endswith(filler):
-                original = original[:-len(filler)].rstrip()
-                if original and original[-1] in "，、；：":
-                    original = original[:-1].rstrip()
-                break
-
-        # 激进模式：去除句中语气词
-        if aggressive:
+        # 循环删除开头语气词（修复bug8）
+        while True:
+            changed = False
             for filler in sorted_fillers:
-                original = re.sub(rf'\s{re.escape(filler)}\s', ' ', original)
-                original = re.sub(rf'^({re.escape(filler)})\s', '', original)
-                original = re.sub(rf'\s({re.escape(filler)})$', '', original)
+                if original.startswith(filler):
+                    original = original[len(filler):].lstrip()
+                    # 如果紧跟着标点，也一并去除
+                    if original and original[0] in "，、；：":
+                        original = original[1:].lstrip()
+                    changed = True
+                    break
+            if not changed:
+                break
+
+        # 循环删除结尾语气词（修复bug8）
+        while True:
+            changed = False
+            for filler in sorted_fillers:
+                if original.endswith(filler):
+                    original = original[:-len(filler)].rstrip()
+                    if original and original[-1] in "，、；：":
+                        original = original[:-1].rstrip()
+                    changed = True
+                    break
+            if not changed:
+                break
+
+        # 激进模式：删除被标点或空格包围的句中语气词（修复bug1）
+        if aggressive:
+            # 使用正则匹配：前面是开头或标点/空格，后面是结尾或标点/空格
+            for filler in sorted_fillers:
+                escaped = re.escape(filler)
+                # 模式：(^|分隔符)语气词(?=分隔符|$)
+                pattern = r'(^|[\s，。！？；：、])(' + escaped + r')(?=[\s，。！？；：、]|$)'
+                # 替换时保留前面的分隔符
+                original = re.sub(pattern, r'\1', original)
+                # 去除可能产生的多余空格
+                original = re.sub(r'\s+', ' ', original).strip()
+
         return original.strip()
 
     def clean_srt(self, content, aggressive=True):
-        """清洗SRT格式字幕，保持时间轴"""
+        """清洗SRT格式字幕，保留时间轴（修复多行合并问题bug6，修复吞序号bug2）"""
         lines = content.split('\n')
         result = []
         i = 0
-        while i < len(lines):
+        n = len(lines)
+        while i < n:
             line = lines[i].strip()
-            if line.isdigit():  # 序号
+            # 序号行
+            if line.isdigit():
                 result.append(line)
                 i += 1
-                if i < len(lines) and '-->' in lines[i]:  # 时间轴
+                if i < n and '-->' in lines[i]:  # 时间轴
                     result.append(lines[i].strip())
                     i += 1
-                    # 文本行
+                    # 收集文本行（直到空行或下一个序号）
                     text_lines = []
-                    while i < len(lines) and lines[i].strip():
+                    while i < n and lines[i].strip():
+                        # 下一行如果是纯数字且其后为时间轴，则当前文本块结束（修复bug2）
+                        if lines[i].strip().isdigit():
+                            # 预读下一行是否可能是时间轴
+                            if i + 1 < n and '-->' in lines[i + 1]:
+                                break
                         text_lines.append(lines[i].strip())
                         i += 1
                     if text_lines:
-                        combined = ' '.join(text_lines)
-                        cleaned = self.clean_text(combined, aggressive)
-                        result.append(cleaned)
+                        # 修复bug6：每行分别清洗后保留原换行结构
+                        cleaned_lines = [
+                            self.clean_text(line, aggressive) for line in text_lines
+                        ]
+                        result.append('\n'.join(cleaned_lines))
                     result.append('')  # 空行
                 else:
-                    # 没有时间轴，直接原样
+                    # 没有时间轴，原样保留
                     result.append(line)
                     i += 1
             else:
@@ -132,41 +198,49 @@ class SubtitleCleaner:
                 cleaned.append('')
         return '\n'.join(cleaned)
 
+
 # ==================== 界面函数 ====================
 
 def load_custom_words_file(file):
-    """加载上传的TXT词库文件，返回内容"""
+    """加载上传的TXT词库文件，修复bug4：无文件或出错时返回gr.update()保持原内容"""
     if file is None:
-        return ""
+        # 不更改自定义词库内容
+        return gr.update()
     try:
-        with open(file.name, 'r', encoding='utf-8') as f:
-            return f.read()
+        content = safe_read_file(file.name)
+        return content
     except Exception as e:
-        return f"读取失败: {e}"
+        gr.Warning(f"读取词库文件失败: {e}")
+        return gr.update()
+
 
 def save_custom_words_file(words_content):
-    """将词库内容保存为临时TXT，返回下载链接"""
+    """将词库内容保存到输出目录并返回下载路径（修复bug5）"""
     if not words_content.strip():
         return None
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    out_name = f"custom_words_{timestamp}.txt"
+    out_path = OUTPUT_DIR / out_name
+    with open(out_path, 'w', encoding='utf-8') as f:
         f.write(words_content)
-        return f.name
+    return str(out_path)
+
 
 def process_file(file, aggressive, custom_words, file_type):
     if file is None:
         return "请上传文件", None
 
     try:
-        with open(file.name, 'r', encoding='utf-8') as f:
-            content = f.read()
+        content = safe_read_file(file.name)  # 修复bug7：自动编码检测
     except Exception as e:
         return f"读取文件失败: {e}", None
 
     cleaner = SubtitleCleaner()
     cleaner.set_custom_words(custom_words)
 
+    # 使用更稳健的SRT检测（修复bug3）
     if file_type == "自动检测":
-        if '-->' in content:
+        if is_srt_content(content):
             cleaned = cleaner.clean_srt(content, aggressive)
             suffix = ".srt"
         else:
@@ -189,12 +263,15 @@ def process_file(file, aggressive, custom_words, file_type):
     preview = '\n'.join(cleaned.split('\n')[:10]) + ('...' if len(cleaned.split('\n')) > 10 else '')
     return preview, str(out_path)
 
+
 def process_text(text, aggressive, custom_words):
     if not text.strip():
         return "请输入文本", None
     cleaner = SubtitleCleaner()
     cleaner.set_custom_words(custom_words)
-    is_srt = '-->' in text
+
+    # 使用更稳健的SRT检测（修复bug3）
+    is_srt = is_srt_content(text)
     if is_srt:
         cleaned = cleaner.clean_srt(text, aggressive)
         suffix = ".srt"
@@ -211,17 +288,19 @@ def process_text(text, aggressive, custom_words):
     preview = '\n'.join(cleaned.split('\n')[:10]) + ('...' if len(cleaned.split('\n')) > 10 else '')
     return preview, str(out_path)
 
+
 # ==================== 创建界面 ====================
 with gr.Blocks(title="字幕清洗工具", theme=gr.themes.Default()) as demo:
     gr.Markdown("""
-    #  字幕清洗工具
+    #  字幕清洗工具（已修复所有已知bug）
     **去除语气词、重复词，支持自定义词库（可保存/加载TXT）**
     """)
 
-    # 初始化自定义词库输入框的内容（如果默认文件存在）
     if DEFAULT_CUSTOM_WORDS_PATH.exists():
-        with open(DEFAULT_CUSTOM_WORDS_PATH, 'r', encoding='utf-8') as f:
-            default_custom_content = f.read()
+        try:
+            default_custom_content = safe_read_file(DEFAULT_CUSTOM_WORDS_PATH)
+        except:
+            default_custom_content = ""
     else:
         default_custom_content = ""
 
@@ -235,9 +314,8 @@ with gr.Blocks(title="字幕清洗工具", theme=gr.themes.Default()) as demo:
                         label="文件类型",
                         value="自动检测"
                     )
-                    aggressive_mode = gr.Checkbox(label="激进模式", value=False)
-                    
-                    # 自定义词库区域（带加载/保存按钮）
+                    aggressive_mode = gr.Checkbox(label="激进模式（谨慎使用，可能误删）", value=False)
+
                     with gr.Group():
                         gr.Markdown("### 自定义词库")
                         custom_words_input = gr.Textbox(
@@ -249,9 +327,7 @@ with gr.Blocks(title="字幕清洗工具", theme=gr.themes.Default()) as demo:
                         with gr.Row():
                             load_btn = gr.Button(" 加载词库文件", variant="secondary")
                             save_btn = gr.Button(" 保存词库文件", variant="secondary")
-                        # 隐藏的上传组件（用于加载词库文件）
                         load_file = gr.File(label="选择词库文件", file_types=[".txt"], visible=False)
-                        # 用于保存词库的下载链接
                         save_download = gr.File(label="下载词库", visible=False)
 
                     submit_btn = gr.Button("开始清洗", variant="primary")
@@ -260,17 +336,18 @@ with gr.Blocks(title="字幕清洗工具", theme=gr.themes.Default()) as demo:
                     file_preview = gr.Textbox(label="清洗预览", lines=15)
                     file_download = gr.File(label="下载清洗后文件")
 
-            # 加载词库按钮：触发隐藏的文件上传
+            # 加载词库：点击后显示隐藏的file上传组件
             load_btn.click(
                 lambda: gr.update(visible=True), None, load_file
             )
+            # 上传成功后调用加载函数并隐藏上传组件
             load_file.change(
                 load_custom_words_file, load_file, custom_words_input
             ).then(
                 lambda: gr.update(visible=False), None, load_file
             )
 
-            # 保存词库按钮：将当前词库内容保存为文件供下载
+            # 保存词库：生成下载文件并显示
             save_btn.click(
                 save_custom_words_file, custom_words_input, save_download
             ).then(
@@ -287,16 +364,13 @@ with gr.Blocks(title="字幕清洗工具", theme=gr.themes.Default()) as demo:
             with gr.Row():
                 with gr.Column(scale=1):
                     text_input = gr.Textbox(label="输入文本", lines=10, placeholder="粘贴要清洗的文本...")
-                    text_aggressive = gr.Checkbox(label="激进模式", value=False)
-                    
-                    # 文本清洗选项卡的自定义词库
+                    text_aggressive = gr.Checkbox(label="激进模式（谨慎使用）", value=False)
                     text_custom = gr.Textbox(
                         label="自定义词库（每行一个词）",
                         placeholder="例如：\n哎哟喂\n我的天\n讲真的",
                         lines=4,
                         value=default_custom_content
                     )
-                    # 同样添加加载/保存按钮
                     with gr.Row():
                         text_load_btn = gr.Button(" 加载词库文件", variant="secondary")
                         text_save_btn = gr.Button(" 保存词库文件", variant="secondary")
