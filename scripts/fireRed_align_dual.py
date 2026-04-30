@@ -1,13 +1,13 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-FireRedASR2S 文稿对齐 + 双语字幕生成（锚点增强·稳定版）
+FireRedASR2S 文稿对齐 + 双语字幕生成（锚点增强·稳定修复版）
 - 智能时间戳检测，精准对齐
 - 可选 FFmpeg 预处理（安全回退）
 - 临时文件存放 PROJECT_ROOT/cache（永久缓存）
 - 新增“强制断行锚点”：完全按稿子换行断句，专为规整文稿设计
 - 帮助页完全外挂：scripts/help_content.json
-Copyright 2026 光影的故事2018
+- 已修复：merge 冲突、锚点清洗干扰、强制断行逻辑、时间戳检测日志增强
 """
 
 import sys, os, re, time, json, gc, logging, threading, atexit, tempfile, hashlib, shutil, subprocess
@@ -319,17 +319,23 @@ class FireRedAlignManager:
             # ========== 修复：稳健的时间戳单位检测 ==========
             max_start = max(starts)
             min_start = min(starts)
+            # 增强日志，便于调试
+            logger.info(f"时间戳范围: [{min_start}, {max_start}], 音频时长: {duration:.2f}s, frame_shift: {frame_shift:.4f}")
             if max_start <= duration * 1.5 and max_start > 0.01 * duration:
                 timestamps_sec = list(zip(starts, ends))
+                logger.info("时间戳单位检测：秒（直接使用）")
             else:
                 hypothetical_max_sec = max_start * frame_shift
                 if abs(hypothetical_max_sec - duration) < 0.2 * duration:
                     timestamps_sec = [(s * frame_shift, e * frame_shift) for s, e in zip(starts, ends)]
+                    logger.info("时间戳单位检测：帧索引（frame_shift 缩放）")
                 elif max_start > duration * 1000:
                     scale = duration / max_start * 0.99
                     timestamps_sec = [(s * scale, e * scale) for s, e in zip(starts, ends)]
+                    logger.info(f"时间戳单位检测：未知单位（缩放至音频时长，缩放因子: {scale:.6f}）")
                 else:
                     timestamps_sec = [(s * frame_shift, e * frame_shift) for s, e in zip(starts, ends)]
+                    logger.info("时间戳单位检测：回退帧索引缩放")
 
             min_len = min(len(timestamps_sec), len(token_ids))
             timestamps_sec = timestamps_sec[:min_len]
@@ -409,11 +415,10 @@ def merge_timestamps_to_sentences(timestamps, words,
                                    merge_by_charcount=True,
                                    merge_by_duration=True,
                                    force_break_indices=None):
-    """修复版合并函数：支持 CJK 检测，英文自动空格连接"""
+    """修复版合并函数：支持 CJK 检测，修复段落边界被静音/字数提前切断的问题"""
     if len(timestamps) == 0:
         return []
 
-    # 检测是否含有中日韩文字
     has_cjk = any(re.search(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', w) for w in words)
     join_str = "" if has_cjk else " "
 
@@ -423,22 +428,26 @@ def merge_timestamps_to_sentences(timestamps, words,
     last_end = timestamps[0][1]
 
     for i, ((start, end), word) in enumerate(zip(timestamps, words)):
+        # ----- 决定是否提前断句 (break_before) -----
         break_before = False
         if current_words:
-            if merge_by_silence and i > 0:
-                gap = start - last_end
-                if gap > silence_threshold:
+            # 修复 Bug 1: 如果当前词是强制断点的段尾，禁止因静音/字数等原因提前断句
+            is_force_break_end = (force_break_indices is not None and i < len(force_break_indices) and force_break_indices[i])
+            if not is_force_break_end:
+                if merge_by_silence and i > 0:
+                    gap = start - last_end
+                    if gap > silence_threshold:
+                        break_before = True
+                if not break_before and merge_by_wordcount and len(current_words) >= max_words:
                     break_before = True
-            if not break_before and merge_by_wordcount and len(current_words) >= max_words:
-                break_before = True
-            if not break_before and merge_by_charcount:
-                new_text = join_str.join(current_words + [word])
-                if len(new_text) > max_chars:
-                    break_before = True
-            if not break_before and merge_by_duration:
-                current_dur = last_end - current_start
-                if current_dur + (end - start) >= max_duration:
-                    break_before = True
+                if not break_before and merge_by_charcount:
+                    new_text = join_str.join(current_words + [word])
+                    if len(new_text) > max_chars:
+                        break_before = True
+                if not break_before and merge_by_duration:
+                    current_dur = last_end - current_start
+                    if current_dur + (end - start) >= max_duration:
+                        break_before = True
 
         if break_before:
             sentences.append({
@@ -454,6 +463,7 @@ def merge_timestamps_to_sentences(timestamps, words,
         current_words.append(word)
         last_end = end
 
+        # ----- 决定是否在词后断句 (should_break_after) -----
         should_break_after = False
         if force_break_indices and i < len(force_break_indices) and force_break_indices[i]:
             should_break_after = True
@@ -479,6 +489,7 @@ def merge_timestamps_to_sentences(timestamps, words,
 
 # ==================== 锚点增强 ====================
 def clean_text_for_anchor(text: str) -> str:
+    """清洗文本，保留中英文、标点、换行，去除其它符号"""
     text = re.sub(r'[^\u4e00-\u9fff\u3000-\u303f\uff00-\uffef a-zA-Z0-9，。！？；：“”‘’（）【】\n]', '', text)
     text = re.sub(r' +', ' ', text)
     return text
@@ -599,7 +610,7 @@ def run_alignment(
     merge_by_charcount, merge_by_duration, merge_by_newline,
     use_anchor_start, use_anchor_end, use_anchor_mean, anchor_char_count,
     force_preprocess,
-    force_linebreak_mode=False,   # 新增：强制断行锚点模式
+    force_linebreak_mode=False,   # 强制断行锚点模式
     progress=gr.Progress()
 ):
     if audio_file is None:
@@ -607,12 +618,16 @@ def run_alignment(
     if not primary_text or not primary_text.strip():
         return "错误: 请粘贴主文稿", "", "", "", "", "", "", get_system_status()
 
-    # 在强制断行模式下直接使用原始文稿，不清洗
+    # ----- 文本准备：强制断行模式使用原始文本，锚点模式使用清洗文本，但断句始终基于原始文本 -----
+    anchor_enabled = use_anchor_start or use_anchor_end or use_anchor_mean
     if force_linebreak_mode:
-        primary_text_cleaned = primary_text
+        # 强制断行模式：对齐文本使用原始文稿（不清洗），以保证与 tokenize 的一致
+        primary_text_clean = primary_text
+    elif anchor_enabled:
+        # 锚点增强：对齐文本使用清洗后的文稿，断句仍用原始文本
+        primary_text_clean = clean_text_for_anchor(primary_text)
     else:
-        anchor_enabled = use_anchor_start or use_anchor_end or use_anchor_mean
-        primary_text_cleaned = clean_text_for_anchor(primary_text) if anchor_enabled else primary_text
+        primary_text_clean = primary_text
 
     audio_path = safe_audio_path(audio_file)
     if not audio_path or not os.path.exists(audio_path):
@@ -626,7 +641,7 @@ def run_alignment(
 
     progress(0.2, desc="强制对齐中...")
     word_srt, sent_srt, timestamps, words, token_ids_out, error = manager.force_align(
-        audio_path, primary_text_cleaned, force_preprocess=force_preprocess
+        audio_path, primary_text_clean, force_preprocess=force_preprocess
     )
     if error:
         return f"错误: {error}", "", "", "", "", "", "", get_system_status()
@@ -649,8 +664,8 @@ def run_alignment(
                 line_tokens, line_ids = asr.tokenizer.tokenize(line)
                 if not line_tokens:
                     continue
-                # 使用 token ID 匹配，精确度更高
                 found = -1
+                # 优先使用 token ID 匹配
                 for start in range(current_pos, total_words - len(line_ids) + 1):
                     if token_ids_out[start:start+len(line_ids)] == line_ids:
                         found = start
@@ -661,7 +676,7 @@ def run_alignment(
                         force_break[end_idx] = True
                     current_pos = end_idx + 1
                 else:
-                    # 尝试降级字符串匹配
+                    # 降级为字符串匹配
                     for start in range(current_pos, total_words - len(line_tokens) + 1):
                         if words[start:start+len(line_tokens)] == line_tokens:
                             found = start
@@ -675,20 +690,21 @@ def run_alignment(
                         merge_warnings.append(f"强制断行失败：无法匹配行 '{line[:30]}...'，将忽略该行")
                         current_pos += max(len(line_tokens), 1)
             final_force_break = force_break
-        # 在强制断行模式下，所有自动断句规则都设为无效
+        # 强制断行模式下，所有自动断句规则均无效
         merge_by_punc = False
         merge_by_silence = False
         merge_by_wordcount = False
         merge_by_charcount = False
         merge_by_duration = False
+        merge_by_newline = False  # 修复 Bug 3：显式禁用
 
     # ---------- 常规断句逻辑（非强制模式下） ----------
     if not force_linebreak_mode:
         force_break = None
-        # 空行断句
         progress(0.4, desc="处理空行断句...")
+        # 空行断句：注意使用原始 primary_text（保证换行正确）
         if merge_by_newline and words and timestamps:
-            paragraphs = [p.strip() for p in primary_text_cleaned.split('\n') if p.strip()]
+            paragraphs = [p.strip() for p in primary_text.split('\n') if p.strip()]  # 使用原始文本
             if len(paragraphs) > 1:
                 force_break = [False] * len(words)
                 current_pos = 0
@@ -708,6 +724,7 @@ def run_alignment(
                             force_break[end_idx] = True
                         current_pos = end_idx + 1
                     else:
+                        # 降级字符串匹配
                         para_clean = re.sub(r'[^\w\u4e00-\u9fff]', '', para)
                         for start in range(current_pos, total_words - len(para_tokens) + 1):
                             segment = ''.join(words[start:start+len(para_tokens)])
@@ -725,26 +742,25 @@ def run_alignment(
                             merge_warnings.append(f"警告：段落 '{para[:30]}...' 无法匹配")
                     progress(0.4 + 0.1 * min(current_pos / total_words, 1.0), desc="处理空行断句...")
 
-        # 标点断句
         progress(0.55, desc="处理标点断句...")
         force_break_punc = None
         if merge_by_punc and words and timestamps:
-            punc_positions = [idx for idx, ch in enumerate(primary_text_cleaned) if ch in merge_punctuations]
+            punc_positions = [idx for idx, ch in enumerate(primary_text) if ch in merge_punctuations]  # 使用原始文本
             if punc_positions:
-                tokens_all, token_ids_all = asr.tokenizer.tokenize(primary_text_cleaned)
-                char_to_token = [-1] * len(primary_text_cleaned)
+                tokens_all, token_ids_all = asr.tokenizer.tokenize(primary_text)  # 原始文本
+                char_to_token = [-1] * len(primary_text)
                 cur = 0
                 for token_idx, token in enumerate(tokens_all):
                     token_len = len(token)
                     for i in range(token_len):
-                        if cur + i < len(primary_text_cleaned):
+                        if cur + i < len(primary_text):
                             char_to_token[cur + i] = token_idx
                     cur += token_len
                 force_break_punc = [False] * len(words)
                 for pos in punc_positions:
                     if pos < len(char_to_token):
                         tidx = char_to_token[pos]
-                        if 0 <= tidx < len(words) - 1:   # 修复：末尾标点不断句
+                        if 0 <= tidx < len(words) - 1:   # 末尾标点不断句
                             force_break_punc[tidx] = True
 
         if force_break is not None or force_break_punc is not None:
@@ -776,7 +792,6 @@ def run_alignment(
 
     # 锚点增强（在 final_force_break 存在且启用锚点时）
     anchor_srt = ""
-    anchor_enabled = use_anchor_start or use_anchor_end or use_anchor_mean
     if anchor_enabled and final_force_break and words and timestamps:
         audio_duration = timestamps[-1][1] + 0.5 if timestamps else 0.0
         anchor_sentences = anchor_align_segments(
@@ -924,6 +939,7 @@ def batch_process(
             results.append(f"❌ {os.path.basename(audio_path)}: 读取文稿失败 - {e}")
             continue
 
+        # 批量处理使用原始文本对齐
         word_srt, sent_srt, timestamps, words, token_ids_out, error = manager.force_align(audio_path, primary_text, force_preprocess=force_preprocess)
         if error:
             results.append(f"❌ {os.path.basename(audio_path)}: 对齐失败 - {error}")
@@ -972,7 +988,7 @@ def batch_process(
                 for pos in punc_positions:
                     if pos < len(char_to_token):
                         tidx = char_to_token[pos]
-                        if 0 <= tidx < len(words):
+                        if 0 <= tidx < len(words) - 1:  # 末尾标点不断句
                             force_break_punc[tidx] = True
 
         final_force_break = [False] * len(words)
@@ -983,6 +999,7 @@ def batch_process(
             for i, v in enumerate(force_break_punc):
                 if v: final_force_break[i] = True
 
+        # 注意：此处 merge_by_punc 传 False 是因为标点已通过 force_break_punc 处理，避免重复断句
         sentences = merge_timestamps_to_sentences(
             timestamps, words,
             sentence_endings=merge_punctuations,
@@ -990,7 +1007,7 @@ def batch_process(
             max_chars=merge_max_chars,
             max_duration=merge_max_duration,
             silence_threshold=merge_silence_threshold,
-            merge_by_punc=False,
+            merge_by_punc=False,  # 标点已手动断句，此处禁用
             merge_by_silence=merge_by_silence,
             merge_by_wordcount=merge_by_wordcount,
             merge_by_charcount=merge_by_charcount,
@@ -1026,7 +1043,7 @@ def create_ui():
             logger.warning(f"加载帮助文件失败: {e}")
 
     with gr.Blocks(title="FireRedASR2S 文稿对齐 + 双语字幕生成（锚点增强）", theme=gr.themes.Default()) as demo:
-        gr.Markdown("# 🎬 FireRedASR2S 文稿对齐 + 双语字幕生成（锚点增强版）")
+        gr.Markdown("# 🎬 FireRedASR2S 文稿对齐 + 双语字幕生成（锚点增强）")
 
         with gr.Tabs():
             # ---------- 单次处理 ----------
@@ -1055,37 +1072,41 @@ def create_ui():
                                 load_model_btn = gr.Button("加载模型", variant="primary")
                                 unload_model_btn = gr.Button("卸载模型", variant="secondary")
                                 refresh_status_btn = gr.Button("刷新状态", variant="secondary")
+                    
+                        with gr.Accordion("📝 断句规则（推荐只勾选“按空行分段”）", open=True):
+                            merge_newline = gr.Checkbox(label="按空行分段（推荐）", value=True)
+                            with gr.Accordion("更多规则（可选）", open=False):
+                                with gr.Row():
+                                    merge_punc = gr.Checkbox(label="按标点断句", value=False)
+                                    merge_silence = gr.Checkbox(label="按静音断句", value=False)
+                                    merge_wordcount = gr.Checkbox(label="按词数断句", value=False)
+                                with gr.Row():
+                                    merge_charcount = gr.Checkbox(label="按字符数断句", value=False)
+                                    merge_duration = gr.Checkbox(label="按时长断句", value=False)
+                                with gr.Row():
+                                    punc_box = gr.Textbox(label="句末标点", value="。！？.!?", scale=2)
+                                    silence_slider = gr.Slider(0.1, 1.0, value=0.3, step=0.05, label="静音阈值 (秒)")
+                                with gr.Row():
+                                    max_words_slider = gr.Slider(5, 50, value=20, step=1, label="最大词数")
+                                    max_chars_slider = gr.Slider(5, 100, value=30, step=5, label="最大字符数")
+                                    max_duration_slider = gr.Slider(1.0, 20.0, value=10.0, step=0.5, label="最大时长 (秒)")
 
-                        with gr.Accordion("📝 字幕合并规则", open=True):
-                            # 新增：强制断行锚点（最上方优先显示）
-                            force_linebreak_cb = gr.Checkbox(
-                                label="📌 强制断行锚点（按稿子换行强制分段，忽略所有自动规则，专为规整文稿设计）",
-                                value=False,
-                                info="开启后，将完全依据文稿的原始换行进行分段，首字/尾字定位起止时间，忽略标点、静音、时长等断句规则"
-                            )
+                        with gr.Accordion(" 锚点增强与分段 (实验性，默认关闭)", open=False):
                             with gr.Row():
-                                merge_newline = gr.Checkbox(label="按空行分段（推荐）", value=True)
-                                merge_punc = gr.Checkbox(label="按标点断句", value=True)
-                                merge_silence = gr.Checkbox(label="按静音断句", value=True)
-                            with gr.Row():
-                                merge_wordcount = gr.Checkbox(label="按词数断句", value=True)
-                                merge_charcount = gr.Checkbox(label="按字符数断句", value=True)
-                                merge_duration = gr.Checkbox(label="按时长断句", value=True)
-                            with gr.Row():
-                                punc_box = gr.Textbox(label="句末标点", value="。！？.!?", scale=2)
-                                silence_slider = gr.Slider(label="静音阈值 (秒)", minimum=0.1, maximum=1.0, value=0.3, step=0.05, scale=1)
-                            with gr.Row():
-                                max_words_slider = gr.Slider(label="最大词数", minimum=5, maximum=50, value=20, step=1)
-                                max_chars_slider = gr.Slider(label="最大字符数", minimum=5, maximum=100, value=30, step=5)
-                                max_duration_slider = gr.Slider(label="最大时长 (秒)", minimum=1.0, maximum=20.0, value=10.0, step=0.5)
-                            with gr.Row():
-                                gr.Markdown("**锚点增强选项**（需先启用空行分段，独立于强制断行模式）")
+                                gr.Markdown("**字符锚点微调**（需配合空行分段）")
                             with gr.Row():
                                 use_anchor_start = gr.Checkbox(label="前锚点", value=False, info="段落开头取前几个汉字校准开始时间")
                                 use_anchor_end = gr.Checkbox(label="后锚点", value=False, info="段落结尾取后几个汉字校准结束时间")
                                 use_anchor_mean = gr.Checkbox(label="前后均值", value=False, info="开始/结束取前后锚点的平均值，覆盖单独选项")
                             with gr.Row():
                                 anchor_char_count = gr.Slider(1, 5, value=3, step=1, label="锚点参考汉字数")
+                                
+                            gr.Markdown("以下选项为特殊场景设计，**通常无需开启**。空行分段已能覆盖绝大多数文稿。")
+                            force_linebreak_cb = gr.Checkbox(
+                                label="📌 强制断行锚点（按稿子原始换行强制分段）",
+                                value=False,
+                                info="开启后完全依照换行分段，忽略标点、静音等自动规则。仅推荐极规整的纯文本使用。"
+                            )                                
 
                         with gr.Row():
                             run_btn = gr.Button("开始对齐", variant="primary", size="lg")
@@ -1163,7 +1184,7 @@ def create_ui():
                 merge_charcount, merge_duration, merge_newline,
                 use_anchor_start, use_anchor_end, use_anchor_mean, anchor_char_count,
                 force_preprocess_check,
-                force_linebreak_cb   # 新增输入
+                force_linebreak_cb
             ],
             outputs=[task_status, word_output, sent_output, merged_output,
                      secondary_output, dual_output, anchor_output, system_status]
@@ -1206,7 +1227,7 @@ def create_ui():
 
         gr.HTML("""
         <div style="text-align: center; color: #666; font-size: 0.85em; margin-top: 20px;">
-            <p>© 2026 光影紐扣 | 基于 FireRedASR2S (Apache 2.0)</p>
+            <p>© 2026 光影紐扣 | 基于 FireRedASR2S (Apache 2.0) 修复版</p>
             <p>更新请关注B站：光影的故事2018 | 日志文件: logs/align_*.log</p>
         </div>
         """)
