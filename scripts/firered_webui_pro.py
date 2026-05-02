@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 FireRedASR2S WebUI pro 专业版
+
 Copyright 2026 光影的故事2018
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -9,12 +10,6 @@ you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
     http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
 """
 
 import sys
@@ -37,6 +32,7 @@ from datetime import timedelta
 # ==================== 日志设置 ====================
 LOG_DIR = Path(__file__).parent.parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
+
 def clean_old_logs(days=7):
     cutoff = time.time() - days * 24 * 3600
     for f in LOG_DIR.glob("error_*.log"):
@@ -45,6 +41,7 @@ def clean_old_logs(days=7):
                 f.unlink()
             except:
                 pass
+
 clean_old_logs()
 log_file = LOG_DIR / f"error_{time.strftime('%Y%m%d')}.log"
 logging.basicConfig(filename=log_file, level=logging.ERROR,
@@ -725,7 +722,7 @@ def transcribe_audio(audio, asr_model_type, use_gpu, use_half, enable_vad, enabl
     progress(1.0, desc="完成")
     return disp_text, disp_word_json, disp_sent_json, disp_srt
 
-# ==================== 视频字幕（已移除了 force_preprocess 参数）====================
+# ==================== 视频字幕（增加 force_preprocess 参数）====================
 def transcribe_video(video, asr_model_type, use_gpu, use_half, enable_vad, enable_lid, enable_punc,
                      beam_size, nbest, decode_max_len, softmax_smoothing, aed_length_penalty,
                      eos_penalty, elm_weight,
@@ -736,6 +733,7 @@ def transcribe_video(video, asr_model_type, use_gpu, use_half, enable_vad, enabl
                      v_enable_charcount, v_merge_max_chars,
                      v_enable_punc, v_merge_punctuations,
                      v_enable_silence, v_merge_silence_threshold,
+                     force_preprocess,   # 新增
                      progress=gr.Progress()):
     temp_audio_path = None
     try:
@@ -779,8 +777,8 @@ def transcribe_video(video, asr_model_type, use_gpu, use_half, enable_vad, enabl
             return f"音频提取失败: {e.stderr}", "", "", ""
 
         progress(0.4, desc="识别音频...")
-        # 视频提取的音频已经是 16kHz 单声道，无需再预处理
-        result, _, error = manager.transcribe(temp_audio_path, force_preprocess=False)
+        # 根据用户选择决定是否强制预处理
+        result, _, error = manager.transcribe(temp_audio_path, force_preprocess=force_preprocess)
         if error:
             return f"识别失败: {error}", "", "", ""
 
@@ -834,13 +832,17 @@ def transcribe_video(video, asr_model_type, use_gpu, use_half, enable_vad, enabl
             except:
                 pass
 
-# ==================== 批量处理 ====================
+# ==================== 批量处理（添加独立合并参数）====================
 def transcribe_batch(files, asr_model_type, use_gpu, use_half, enable_vad, enable_lid, enable_punc,
                      beam_size, nbest, decode_max_len, softmax_smoothing, aed_length_penalty,
                      eos_penalty, elm_weight,
                      vad_min_speech_frame, vad_max_speech_frame, vad_min_silence_frame,
                      vad_speech_threshold, vad_smooth_window_size,
-                     punc_threshold,
+                     punc_threshold, force_preprocess,
+                     batch_enable_duration, batch_merge_max_duration,
+                     batch_enable_charcount, batch_merge_max_chars,
+                     batch_enable_punc, batch_merge_punctuations,
+                     batch_enable_silence, batch_merge_silence_threshold,
                      progress=gr.Progress()):
     if not files:
         return "请选择音频文件"
@@ -867,11 +869,27 @@ def transcribe_batch(files, asr_model_type, use_gpu, use_half, enable_vad, enabl
     for i, file_obj in enumerate(files, 1):
         file_path = file_obj.name if hasattr(file_obj, 'name') else str(file_obj)
         progress(i/total, desc=f"处理 {i}/{total}: {os.path.basename(file_path)}")
-        result, _, error = manager.transcribe(file_path, force_preprocess=True)
+        result, _, error = manager.transcribe(file_path, force_preprocess=force_preprocess)
         if error:
             results_summary.append(f"【{os.path.basename(file_path)}】错误: {error}")
         else:
             full_text, sent_json, srt_text, word_segments, word_json = format_result_to_outputs(result)
+            # 应用合并参数
+            if word_segments:
+                ts_data = [(s["start"], s["end"]) for s in word_segments]
+                texts = [s["text"] for s in word_segments]
+                merged = merge_timestamps_to_sentences(
+                    ts_data, texts,
+                    sentence_endings=batch_merge_punctuations,
+                    max_chars=batch_merge_max_chars, max_duration=batch_merge_max_duration,
+                    silence_threshold=batch_merge_silence_threshold,
+                    merge_by_punc=batch_enable_punc, merge_by_silence=batch_enable_silence,
+                    merge_by_wordcount=False, merge_by_charcount=batch_enable_charcount,
+                    merge_by_duration=batch_enable_duration
+                )
+                srt_text = sentences_to_srt(merged)
+                sent_json = json.dumps(merged, ensure_ascii=False, indent=2)
+
             saved, prefix = save_outputs(file_path, full_text, sent_json, srt_text, "自动检测", asr_model_type)
             if word_segments:
                 word_json_path = OUTPUT_DIR / f"{prefix}_words.json"
@@ -926,7 +944,7 @@ def open_file_or_dir(path: str):
         subprocess.Popen(["open", path])
     else:
         subprocess.Popen(["xdg-open", path])
-        
+
 def clear_cache_fully():
     """清空缓存目录下的所有 .wav 文件"""
     count = 0
@@ -936,7 +954,7 @@ def clear_cache_fully():
             count += 1
         except Exception:
             pass
-    return f"已删除 {count} 个缓存文件"        
+    return f"已删除 {count} 个缓存文件"
 
 # ==================== 创建 Gradio 界面 ====================
 def create_interface():
@@ -966,8 +984,6 @@ def create_interface():
                     refresh_btn = gr.Button("刷新状态", variant="secondary")
                     health_btn = gr.Button("健康检查", variant="secondary")
 
-        load_msg = gr.Textbox(label="操作提示", interactive=False, visible=True)
-
         def health_check():
             info = get_system_info()
             with manager.lock:
@@ -978,30 +994,33 @@ def create_interface():
             return info
         health_btn.click(health_check, outputs=[status_display])
 
+        # ========== 布局：第一行 ASR 模型类型 + 操作提示 ==========
         with gr.Row():
-            with gr.Column(scale=1):
-                asr_model_type = gr.Dropdown(
-                    label="ASR 模型类型", choices=model_choices, value="aed",
-                    info="aed: 平衡性能与效率；llm: 追求极致准确率"
-                )
-            with gr.Column(scale=1):
-                use_gpu = gr.Checkbox(label="使用 GPU", value=torch.cuda.is_available())
-                default_half = torch.cuda.is_available() and torch.cuda.get_device_properties(0).total_memory < 10e9
-                use_half = gr.Checkbox(
-                    label="使用半精度 (FP16)", value=default_half,
-                    info="开启后显存占用减半"
-                )
+            asr_model_type = gr.Dropdown(
+                label="ASR 模型类型",
+                choices=model_choices,
+                value="aed",               
+                scale=2
+            )
+            load_msg = gr.Textbox(
+                label="操作提示",
+                interactive=False,
+                visible=True,
+                scale=3
+            )
 
+        # ========== 第二行：加载/卸载按钮 + 所有复选框 ==========
         with gr.Row():
-            with gr.Column(scale=1):
-                with gr.Row():
-                    load_btn = gr.Button("加载模型", variant="primary")
-                    unload_btn = gr.Button("卸载模型", variant="stop")
-            with gr.Column(scale=1):
-                with gr.Row():
-                    enable_vad = gr.Checkbox(label="启用 VAD", value=True)
-                    enable_lid = gr.Checkbox(label="启用 LID", value=True)
-                    enable_punc = gr.Checkbox(label="启用 标点恢复", value=True)
+            load_btn = gr.Button("加载模型", variant="primary", scale=1)
+            unload_btn = gr.Button("卸载模型", variant="stop", scale=1)
+            use_gpu = gr.Checkbox(label="使用 GPU", value=torch.cuda.is_available(), scale=1)
+            default_half = torch.cuda.is_available() and torch.cuda.get_device_properties(0).total_memory < 10e9
+            use_half = gr.Checkbox(
+                label="使用半精度 (FP16)", value=default_half, scale=1   
+            )
+            enable_vad = gr.Checkbox(label="启用 VAD", value=True, scale=1)
+            enable_lid = gr.Checkbox(label="启用 LID", value=True, scale=1)
+            enable_punc = gr.Checkbox(label="启用 标点恢复", value=True, scale=1)
 
         with gr.Accordion("高级参数", open=False):
             gr.Markdown("### 解码参数")
@@ -1041,7 +1060,7 @@ def create_interface():
 
         gr.Markdown("---")
         with gr.Tabs():
-            # 音频识别
+            # ---------- 音频识别 ----------
             with gr.Tab("音频识别"):
                 with gr.Row():
                     with gr.Column(scale=1):
@@ -1068,7 +1087,6 @@ def create_interface():
                         with gr.Row():
                             transcribe_btn = gr.Button("开始识别", variant="primary")
                             c_btn = gr.Button("清空", variant="secondary")
-
                     with gr.Column(scale=2):
                         with gr.Tabs():
                             with gr.Tab("识别文本"):
@@ -1109,11 +1127,14 @@ def create_interface():
                              text_output, word_json_output, sent_json_output, srt_output]
                 )
 
-            # 视频字幕
+            # ---------- 视频字幕（增加强制预处理复选框）----------
             with gr.Tab("视频字幕"):
                 with gr.Row():
                     with gr.Column(scale=1):
                         video_input = gr.Video(label="选择视频文件", sources=["upload"])
+                        force_preprocess_video = gr.Checkbox(
+                            label="⚡ 强制预处理音频 (推荐大文件)", value=False, interactive=True
+                        )
                         with gr.Accordion("字幕合并参数", open=True):
                             v_enable_duration = gr.Checkbox(label="启用单条最大时长限制", value=True)
                             v_merge_max_duration = gr.Slider(1.0, 20.0, 10.0, step=0.5, label="单条最大时长 (秒)")
@@ -1148,7 +1169,8 @@ def create_interface():
                             v_enable_duration, v_merge_max_duration,
                             v_enable_charcount, v_merge_max_chars,
                             v_enable_punc, v_merge_punctuations,
-                            v_enable_silence, v_merge_silence_threshold],
+                            v_enable_silence, v_merge_silence_threshold,
+                            force_preprocess_video],
                     outputs=[video_text_output, video_word_json_output, video_sent_json_output, video_srt_output]
                 ).then(refresh_status, outputs=[status_display])
 
@@ -1157,28 +1179,62 @@ def create_interface():
                     outputs=[video_input, video_text_output, video_word_json_output, video_sent_json_output, video_srt_output]
                 )
 
-            # 批量处理
+            # ---------- 批量处理（添加独立合并参数）----------
             with gr.Tab("批量处理"):
-                file_input = gr.Files(
-                    label="上传多个音频文件",
-                    file_types=[".wav", ".mp3", ".m4a", ".flac", ".ogg"],
-                    file_count="multiple"
-                )
-                batch_transcribe_btn = gr.Button("批量识别", variant="primary")
-                batch_clear = gr.Button("清空", variant="secondary")
-                batch_output = gr.Textbox(label="批量结果", lines=20, show_copy_button=True)
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        file_input = gr.File(
+                            label="上传多个音频文件",
+                            file_types=[".wav", ".mp3", ".m4a", ".flac", ".ogg"],
+                            file_count="multiple",
+                            type="filepath"
+                        )
+                        force_preprocess_batch = gr.Checkbox(label="⚡ 强制预处理", value=True)
+                        with gr.Accordion("字幕合并参数", open=True):
+                            with gr.Row():
+                                batch_enable_duration = gr.Checkbox(label="启用单条最大时长限制", value=True)
+                                batch_merge_max_duration = gr.Slider(1.0, 20.0, 10.0, step=0.5, label="单条最大时长 (秒)")
+                            with gr.Row():
+                                batch_enable_charcount = gr.Checkbox(label="启用单条最大字符数限制", value=True)
+                                batch_merge_max_chars = gr.Slider(5, 100, 30, step=5, label="单条最大字符数")
+                            with gr.Row():
+                                batch_enable_silence = gr.Checkbox(label="启用静音阈值分句", value=True)
+                                batch_merge_silence_threshold = gr.Slider(0.1, 1.0, 0.3, step=0.05, label="静音阈值 (秒)")
+                            with gr.Row():
+                                batch_enable_punc = gr.Checkbox(label="启用句末标点分句", value=True)
+                                batch_merge_punctuations = gr.Textbox(value="。！？.!?", label="句末标点")
+                        with gr.Row():
+                            batch_transcribe_btn = gr.Button("批量识别", variant="primary")
+                            batch_clear = gr.Button("清空", variant="secondary")
+                    with gr.Column(scale=2):
+                        batch_output = gr.Textbox(label="批量结果", lines=20, show_copy_button=True)
+
                 batch_transcribe_btn.click(
                     transcribe_batch,
                     inputs=[file_input, asr_model_type, use_gpu, use_half, enable_vad, enable_lid, enable_punc,
                             beam_size, nbest, decode_max_len, softmax_smoothing, aed_length_penalty,
                             eos_penalty, elm_weight,
                             vad_min_speech_frame, vad_max_speech_frame, vad_min_silence_frame,
-                            vad_speech_threshold, vad_smooth_window_size, punc_threshold],
+                            vad_speech_threshold, vad_smooth_window_size, punc_threshold,
+                            force_preprocess_batch,
+                            batch_enable_duration, batch_merge_max_duration,
+                            batch_enable_charcount, batch_merge_max_chars,
+                            batch_enable_punc, batch_merge_punctuations,
+                            batch_enable_silence, batch_merge_silence_threshold],
                     outputs=[batch_output]
                 ).then(refresh_status, outputs=[status_display])
-                batch_clear.click(lambda: [None, ""], outputs=[file_input, batch_output])
 
-            # 系统信息
+                # 清空时重置所有控件（文件、结果、合并参数）
+                batch_clear.click(
+                    lambda: [None, "", True, 10.0, True, 30, True, "。！？.!?", True, 0.3],
+                    outputs=[file_input, batch_output,
+                             batch_enable_duration, batch_merge_max_duration,
+                             batch_enable_charcount, batch_merge_max_chars,
+                             batch_enable_punc, batch_merge_punctuations,
+                             batch_enable_silence, batch_merge_silence_threshold]
+                )
+
+            # ---------- 系统信息 ----------
             with gr.Tab("系统信息"):
                 system_info_text = gr.Textbox(value=get_system_info(), lines=20, label="详细信息", show_copy_button=True)
                 with gr.Row():
@@ -1223,7 +1279,7 @@ def create_interface():
                 )
 
                 clear_temp_btn.click(lambda: f"清理了 {manager.cleanup_temp()} 个临时文件", outputs=[config_status])
-                clear_all_cache_btn.click(clear_cache_fully, outputs=[config_status])                
+                clear_all_cache_btn.click(clear_cache_fully, outputs=[config_status])
 
                 def save_current_config():
                     config = {
