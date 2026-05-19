@@ -4,12 +4,7 @@
 FireRedASR2S WebUI pro 专业版
 
 Copyright 2026 光影的故事2018
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
+Licensed under the Apache License, Version 2.0
 """
 
 import sys
@@ -71,19 +66,16 @@ ROOT_DIR = BASE_DIR.parent
 DEFAULT_OUTPUT_DIR = ROOT_DIR / "output"
 OUTPUT_DIR = DEFAULT_OUTPUT_DIR
 
-# 缓存目录（存放临时音频文件）
 CACHE_DIR = ROOT_DIR / "cache"
 CACHE_DIR.mkdir(exist_ok=True)
 
-# 配置文件目录
 PRESET_DIR = ROOT_DIR / "preset"
 PRESET_DIR.mkdir(exist_ok=True)
 CONFIG_FILE = PRESET_DIR / "settings.json"
 
-# 线程锁
 config_lock = threading.RLock()
 
-# ==================== 自动配置 FFmpeg ====================
+# ==================== FFmpeg 配置 ====================
 PORTABLE_FFMPEG_DIR = ROOT_DIR / "ffmpeg" / "bin"
 if sys.platform == "win32":
     PORTABLE_FFMPEG_EXE = PORTABLE_FFMPEG_DIR / "ffmpeg.exe"
@@ -102,7 +94,7 @@ else:
         FFMPEG_PATH = "ffmpeg"
         print("⚠️ 警告：未找到内置 FFmpeg，视频处理可能失败，请将 ffmpeg 放入 ffmpeg/bin 目录。")
 
-# ==================== 加载/保存配置 ====================
+# ==================== 配置保存/加载 ====================
 def load_settings():
     if CONFIG_FILE.exists():
         try:
@@ -119,7 +111,7 @@ def save_settings(settings):
     except Exception as e:
         print(f"保存配置失败: {e}")
 
-# ==================== 导入其他依赖 ====================
+# ==================== 其他依赖 ====================
 try:
     import gradio as gr
     import torch
@@ -141,9 +133,12 @@ class FireRedASR2SManager:
         self.settings = load_settings()
 
     def _find_model_dir(self, model_type="AED"):
+        """自动查找 ASR 模型目录（统一大写）"""
+        model_type_upper = model_type.upper()
         candidates = [
-            ROOT_DIR / "pretrained_models" / f"FireRedASR2-{model_type}",
-            ROOT_DIR / "pretrained_models" / f"FireRedASR2-{model_type}-2025",
+            ROOT_DIR / "pretrained_models" / f"FireRedASR2-{model_type_upper}",
+            ROOT_DIR / "pretrained_models" / f"FireRedASR2-{model_type_upper}-2025",
+            # 回退到已知目录
             ROOT_DIR / "pretrained_models" / "FireRedASR2-AED",
             ROOT_DIR / "pretrained_models" / "FireRedASR2-AED-2025",
         ]
@@ -154,7 +149,6 @@ class FireRedASR2SManager:
         return None
 
     def _find_vad_model_dir(self):
-        """智能查找 VAD 模型目录，支持多种文件格式及子目录"""
         base = ROOT_DIR / "pretrained_models" / "FireRedVAD"
         if not base.exists():
             return None
@@ -174,9 +168,6 @@ class FireRedASR2SManager:
                 return str(path)
         if has_model(base):
             return str(base)
-        alt = ROOT_DIR / "pretrained_models" / "FireRedVAD"
-        if alt.exists() and has_model(alt):
-            return str(alt)
         return None
 
     def _find_lid_model_dir(self):
@@ -332,9 +323,9 @@ class FireRedASR2SManager:
             return None, None, f"识别失败: {str(e)}"
 
     def _prepare_audio(self, audio_input, return_waveform=False, force_preprocess=True):
-        """预处理为 16k 单声道 wav，缓存文件统一放在 CACHE_DIR"""
+        """预处理音频为 16k 单声道 wav，归一化浮点数据"""
         try:
-            # 如果不强制预处理，且输入已是理想格式，直接返回
+            # 如果不强制预处理且输入已是理想格式，直接返回
             if not force_preprocess and isinstance(audio_input, str) and os.path.exists(audio_input):
                 try:
                     info = sf.info(audio_input)
@@ -346,13 +337,20 @@ class FireRedASR2SManager:
                 except:
                     pass
 
-            # 处理元组输入（麦克风/录音）
+            # 处理元组输入（麦克风/录音），归一化到 [-1, 1]
             if isinstance(audio_input, tuple):
                 sr, data = audio_input
                 if data.ndim > 1:
                     data = np.mean(data, axis=1)
+                # 检测是否为整数格式，若是则归一化
+                if data.dtype.kind == 'i' or np.max(np.abs(data)) > 1.0:
+                    data = data.astype(np.float32)
+                    max_val = np.iinfo(np.int16).max if data.dtype == np.int16 else np.max(np.abs(data))
+                    data /= max_val
+                else:
+                    data = data.astype(np.float32)
                 input_path = CACHE_DIR / f"input_{uuid.uuid4().hex}_{int(time.time())}.wav"
-                sf.write(str(input_path), data.astype(np.float32), sr)
+                sf.write(str(input_path), data, sr)
                 self.temp_files.append(str(input_path))
                 need_cleanup_input = True
             elif isinstance(audio_input, str) and os.path.exists(audio_input):
@@ -361,13 +359,18 @@ class FireRedASR2SManager:
             else:
                 return None
 
-            # 转码输出路径
+            # 转码输出
             out_path = CACHE_DIR / f"temp_audio_{uuid.uuid4().hex}_{int(time.time())}.wav"
             cmd = [
                 FFMPEG_PATH, "-y", "-i", str(input_path),
                 "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(out_path)
             ]
-            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            except subprocess.CalledProcessError as e:
+                error_detail = e.stderr.decode(errors='replace') if e.stderr else str(e)
+                logging.error(f"FFmpeg转换失败: {error_detail}")
+                return None
             self.temp_files.append(str(out_path))
 
             if need_cleanup_input and str(input_path) in self.temp_files:
@@ -412,7 +415,6 @@ def seconds_to_srt_time(seconds):
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
 
 def format_result_to_outputs(result):
-    """返回：完整文本、句子级JSON、SRT文本、词级segments列表、词级JSON字符串"""
     if not result or not isinstance(result, dict):
         return "无结果", "{}", "", [], "{}"
 
@@ -421,7 +423,7 @@ def format_result_to_outputs(result):
     words = result.get("words", [])
     vad_segments = result.get("vad_segments_ms", [])
 
-    # 词级 segments
+    # 词级 segments 优先用 words，否则用 sentences
     word_segments = []
     if words:
         for w in words:
@@ -438,7 +440,7 @@ def format_result_to_outputs(result):
                 "text": s.get("text", "")
             })
 
-    # 句子级 segments
+    # 句子级 segments（供直接输出）
     sent_segments = []
     if sentences:
         for s in sentences:
@@ -453,7 +455,7 @@ def format_result_to_outputs(result):
     word_json = json.dumps(word_segments, ensure_ascii=False, indent=2)
     sent_json = json.dumps(sent_segments, ensure_ascii=False, indent=2)
 
-    # SRT
+    # SRT 基于句子级
     srt_lines = []
     for i, seg in enumerate(sent_segments, 1):
         start = seconds_to_srt_time(seg["start"])
@@ -486,29 +488,46 @@ def merge_timestamps_to_sentences(timestamps, words,
     current_start = timestamps[0][0]
     current_words = []
     last_end = timestamps[0][1]
+
     for i, ((start, end), word) in enumerate(zip(timestamps, words)):
         should_break = False
+        # 强制断句索引
         if force_break_indices and i < len(force_break_indices) and force_break_indices[i]:
             should_break = True
         else:
+            # 句末标点断句
             if merge_by_punc and any(word.endswith(p) for p in sentence_endings):
                 should_break = True
+            # 静音阈值断句（仅当已有前词）
             if not should_break and merge_by_silence and i > 0:
                 if start - last_end > silence_threshold:
                     should_break = True
+            # 词数限制
             if not should_break and merge_by_wordcount and len(current_words) + 1 >= max_words:
                 should_break = True
+            # 字符数限制（注意：如果当前只有一个词且已超长，此处无法触发，因此后续单独处理）
             if not should_break and merge_by_charcount and current_words:
                 new_text = join_str.join(current_words + [word])
                 if len(new_text) >= max_chars:
                     should_break = True
+            # 时长限制
             if not should_break and merge_by_duration and current_words:
                 if (last_end - current_start) + (end - start) >= max_duration:
                     should_break = True
+
+        # 处理第一个词超长的情况
+        if not should_break and not current_words:
+            # 单独检查单个词是否已经超过字符数或时长限制
+            if merge_by_charcount and len(word) >= max_chars:
+                should_break = True
+            if merge_by_duration and (end - start) >= max_duration:
+                should_break = True
+
         if not current_words:
             current_start = start
         current_words.append(word)
         last_end = end
+
         if should_break:
             sentences.append({
                 "start": current_start,
@@ -517,6 +536,7 @@ def merge_timestamps_to_sentences(timestamps, words,
             })
             current_start = None
             current_words = []
+
     if current_words:
         sentences.append({
             "start": current_start,
@@ -584,7 +604,7 @@ def get_system_info():
     info.append(f"缓存目录: {CACHE_DIR}")
     return "\n".join(info)
 
-# ==================== 多输出截断函数 ====================
+# ==================== 显示截断 ====================
 def truncate_all_for_display(full_text, word_json, sent_json, srt_text,
                               text_limit=1000, word_item_limit=300, sent_item_limit=300, srt_line_limit=200):
     disp_text = full_text
@@ -638,7 +658,39 @@ def ensure_model_loaded(config_params, advanced_params):
                 raise RuntimeError(f"加载失败: {msg}")
     return manager
 
-# ==================== 音频识别（含 force_preprocess 参数）====================
+# ==================== 标点重新注入 ====================
+def inject_punctuation_to_words(word_segments, full_text_with_punc, punctuation_chars="。！？.!?"):
+    """
+    将 full_text_with_punc 中的标点附加到对应的 word_segments 文本末尾。
+    假设 word_segments 的 text 顺序与去标点后的汉字序列一致。
+    """
+    if not word_segments:
+        return word_segments
+    # 提取所有汉字字符
+    han_chars = re.findall(r'[\u4e00-\u9fff]', full_text_with_punc)
+    if len(han_chars) != len(word_segments):
+        return word_segments  # 长度不匹配则跳过
+
+    # 构建一个带索引的标点位置映射
+    punct_positions = []
+    idx = 0
+    for ch in full_text_with_punc:
+        if ch in punctuation_chars:
+            punct_positions.append((idx, ch))
+        elif re.match(r'[\u4e00-\u9fff]', ch):
+            idx += 1
+        # 其他字符（如空格）忽略，可能影响索引，这里简单处理：只统计汉字
+    # 将标点分配给前一个汉字对应的 word_segment
+    seg_idx = 0
+    for (han_idx, punct_char) in punct_positions:
+        while seg_idx < len(word_segments) and seg_idx < han_idx:
+            seg_idx += 1
+        if seg_idx > 0:
+            # 标点附着到前一个词
+            word_segments[seg_idx - 1]["text"] += punct_char
+    return word_segments
+
+# ==================== 识别函数（音频、视频、批量均使用全局合并参数） ====================
 def transcribe_audio(audio, asr_model_type, use_gpu, use_half, enable_vad, enable_lid, enable_punc,
                      beam_size, nbest, decode_max_len, softmax_smoothing, aed_length_penalty,
                      eos_penalty, elm_weight,
@@ -682,8 +734,13 @@ def transcribe_audio(audio, asr_model_type, use_gpu, use_half, enable_vad, enabl
         return f"错误: {error}", "", "", ""
 
     progress(0.7, desc="生成输出...")
-    full_text, sent_json, srt_text, word_segments, word_json = format_result_to_outputs(result)
+    full_text_with_punc, sent_json_initial, srt_text_initial, word_segments, word_json = format_result_to_outputs(result)
 
+    # --- 标点注入 ---
+    if word_segments and result.get("text"):
+        word_segments = inject_punctuation_to_words(word_segments, result["text"], punctuation_chars=merge_punctuations)
+
+    # 句子合并（使用注入标点后的 word_segments）
     merged_sentences = []
     if word_segments:
         ts_data = [(s["start"], s["end"]) for s in word_segments]
@@ -699,9 +756,12 @@ def transcribe_audio(audio, asr_model_type, use_gpu, use_half, enable_vad, enabl
         )
         srt_text = sentences_to_srt(merged_sentences)
         sent_json = json.dumps(merged_sentences, ensure_ascii=False, indent=2)
+    else:
+        srt_text = srt_text_initial
+        sent_json = sent_json_initial
 
     base_name = audio if isinstance(audio, str) and os.path.exists(audio) else None
-    saved, prefix = save_outputs(base_name, full_text, sent_json, srt_text, "自动检测", asr_model_type)
+    saved, prefix = save_outputs(base_name, full_text_with_punc, sent_json, srt_text, "自动检测", asr_model_type)
     if word_segments:
         word_json_path = OUTPUT_DIR / f"{prefix}_words.json"
         with open(word_json_path, 'w', encoding='utf-8') as f:
@@ -711,7 +771,7 @@ def transcribe_audio(audio, asr_model_type, use_gpu, use_half, enable_vad, enabl
     save_info = "文件已保存:\n"
     for k, v in saved.items():
         save_info += f"  {Path(v).name}\n"
-    full_text_disp = save_info + "\n" + full_text
+    full_text_disp = save_info + "\n" + full_text_with_punc
 
     disp_text, disp_word_json, disp_sent_json, disp_srt = truncate_all_for_display(
         full_text_disp, word_json, sent_json, srt_text
@@ -722,18 +782,17 @@ def transcribe_audio(audio, asr_model_type, use_gpu, use_half, enable_vad, enabl
     progress(1.0, desc="完成")
     return disp_text, disp_word_json, disp_sent_json, disp_srt
 
-# ==================== 视频字幕（增加 force_preprocess 参数）====================
 def transcribe_video(video, asr_model_type, use_gpu, use_half, enable_vad, enable_lid, enable_punc,
                      beam_size, nbest, decode_max_len, softmax_smoothing, aed_length_penalty,
                      eos_penalty, elm_weight,
                      vad_min_speech_frame, vad_max_speech_frame, vad_min_silence_frame,
                      vad_speech_threshold, vad_smooth_window_size,
                      punc_threshold,
-                     v_enable_duration, v_merge_max_duration,
-                     v_enable_charcount, v_merge_max_chars,
-                     v_enable_punc, v_merge_punctuations,
-                     v_enable_silence, v_merge_silence_threshold,
-                     force_preprocess,   # 新增
+                     enable_duration, merge_max_duration,
+                     enable_charcount, merge_max_chars,
+                     enable_punc_merge, merge_punctuations,
+                     enable_silence, merge_silence_threshold,
+                     force_preprocess,
                      progress=gr.Progress()):
     temp_audio_path = None
     try:
@@ -763,7 +822,6 @@ def transcribe_video(video, asr_model_type, use_gpu, use_half, enable_vad, enabl
             return str(e), "", "", ""
 
         progress(0.2, desc="提取视频音频...")
-        # 视频提取的音频直接存到缓存目录
         audio_path = CACHE_DIR / f"video_audio_{uuid.uuid4().hex}_{int(time.time())}.wav"
         temp_audio_path = str(audio_path)
         cmd = [
@@ -774,16 +832,19 @@ def transcribe_video(video, asr_model_type, use_gpu, use_half, enable_vad, enabl
         try:
             subprocess.run(cmd, check=True, capture_output=True, text=True)
         except subprocess.CalledProcessError as e:
-            return f"音频提取失败: {e.stderr}", "", "", ""
+            error_detail = e.stderr if e.stderr else str(e)
+            return f"音频提取失败: {error_detail}", "", "", ""
 
         progress(0.4, desc="识别音频...")
-        # 根据用户选择决定是否强制预处理
         result, _, error = manager.transcribe(temp_audio_path, force_preprocess=force_preprocess)
         if error:
             return f"识别失败: {error}", "", "", ""
 
         progress(0.6, desc="生成字幕...")
-        full_text, sent_json, srt_text, word_segments, word_json = format_result_to_outputs(result)
+        full_text_with_punc, sent_json_initial, srt_text_initial, word_segments, word_json = format_result_to_outputs(result)
+
+        if word_segments and result.get("text"):
+            word_segments = inject_punctuation_to_words(word_segments, result["text"], punctuation_chars=merge_punctuations)
 
         merged_sentences = []
         if word_segments:
@@ -791,18 +852,21 @@ def transcribe_video(video, asr_model_type, use_gpu, use_half, enable_vad, enabl
             texts = [s["text"] for s in word_segments]
             merged_sentences = merge_timestamps_to_sentences(
                 ts_data, texts,
-                sentence_endings=v_merge_punctuations,
-                max_words=50, max_chars=v_merge_max_chars, max_duration=v_merge_max_duration,
-                silence_threshold=v_merge_silence_threshold,
-                merge_by_punc=v_enable_punc, merge_by_silence=v_enable_silence,
-                merge_by_wordcount=False, merge_by_charcount=v_enable_charcount,
-                merge_by_duration=v_enable_duration
+                sentence_endings=merge_punctuations,
+                max_words=50, max_chars=merge_max_chars, max_duration=merge_max_duration,
+                silence_threshold=merge_silence_threshold,
+                merge_by_punc=enable_punc_merge, merge_by_silence=enable_silence,
+                merge_by_wordcount=False, merge_by_charcount=enable_charcount,
+                merge_by_duration=enable_duration
             )
             srt_text = sentences_to_srt(merged_sentences)
             sent_json = json.dumps(merged_sentences, ensure_ascii=False, indent=2)
+        else:
+            srt_text = srt_text_initial
+            sent_json = sent_json_initial
 
         base_name = video if isinstance(video, str) and os.path.exists(video) else None
-        saved, prefix = save_outputs(base_name, full_text, sent_json, srt_text, "自动检测", asr_model_type)
+        saved, prefix = save_outputs(base_name, full_text_with_punc, sent_json, srt_text, "自动检测", asr_model_type)
         if word_segments:
             word_json_path = OUTPUT_DIR / f"{prefix}_words.json"
             with open(word_json_path, 'w', encoding='utf-8') as f:
@@ -812,7 +876,7 @@ def transcribe_video(video, asr_model_type, use_gpu, use_half, enable_vad, enabl
         save_info = "文件已保存:\n"
         for k, v in saved.items():
             save_info += f"  {Path(v).name}\n"
-        combined_text = f"{save_info}\n\n【识别文本】\n{full_text}"
+        combined_text = f"{save_info}\n\n【识别文本】\n{full_text_with_punc}"
 
         disp_text, disp_word_json, disp_sent_json, disp_srt = truncate_all_for_display(
             combined_text, word_json, sent_json, srt_text
@@ -832,17 +896,16 @@ def transcribe_video(video, asr_model_type, use_gpu, use_half, enable_vad, enabl
             except:
                 pass
 
-# ==================== 批量处理（添加独立合并参数）====================
 def transcribe_batch(files, asr_model_type, use_gpu, use_half, enable_vad, enable_lid, enable_punc,
                      beam_size, nbest, decode_max_len, softmax_smoothing, aed_length_penalty,
                      eos_penalty, elm_weight,
                      vad_min_speech_frame, vad_max_speech_frame, vad_min_silence_frame,
                      vad_speech_threshold, vad_smooth_window_size,
                      punc_threshold, force_preprocess,
-                     batch_enable_duration, batch_merge_max_duration,
-                     batch_enable_charcount, batch_merge_max_chars,
-                     batch_enable_punc, batch_merge_punctuations,
-                     batch_enable_silence, batch_merge_silence_threshold,
+                     enable_duration, merge_max_duration,
+                     enable_charcount, merge_max_chars,
+                     enable_punc_merge, merge_punctuations,
+                     enable_silence, merge_silence_threshold,
                      progress=gr.Progress()):
     if not files:
         return "请选择音频文件"
@@ -873,24 +936,29 @@ def transcribe_batch(files, asr_model_type, use_gpu, use_half, enable_vad, enabl
         if error:
             results_summary.append(f"【{os.path.basename(file_path)}】错误: {error}")
         else:
-            full_text, sent_json, srt_text, word_segments, word_json = format_result_to_outputs(result)
-            # 应用合并参数
+            full_text_with_punc, sent_json_initial, srt_text_initial, word_segments, word_json = format_result_to_outputs(result)
+            if word_segments and result.get("text"):
+                word_segments = inject_punctuation_to_words(word_segments, result["text"], punctuation_chars=merge_punctuations)
+
             if word_segments:
                 ts_data = [(s["start"], s["end"]) for s in word_segments]
                 texts = [s["text"] for s in word_segments]
                 merged = merge_timestamps_to_sentences(
                     ts_data, texts,
-                    sentence_endings=batch_merge_punctuations,
-                    max_chars=batch_merge_max_chars, max_duration=batch_merge_max_duration,
-                    silence_threshold=batch_merge_silence_threshold,
-                    merge_by_punc=batch_enable_punc, merge_by_silence=batch_enable_silence,
-                    merge_by_wordcount=False, merge_by_charcount=batch_enable_charcount,
-                    merge_by_duration=batch_enable_duration
+                    sentence_endings=merge_punctuations,
+                    max_chars=merge_max_chars, max_duration=merge_max_duration,
+                    silence_threshold=merge_silence_threshold,
+                    merge_by_punc=enable_punc_merge, merge_by_silence=enable_silence,
+                    merge_by_wordcount=False, merge_by_charcount=enable_charcount,
+                    merge_by_duration=enable_duration
                 )
                 srt_text = sentences_to_srt(merged)
                 sent_json = json.dumps(merged, ensure_ascii=False, indent=2)
+            else:
+                srt_text = srt_text_initial
+                sent_json = sent_json_initial
 
-            saved, prefix = save_outputs(file_path, full_text, sent_json, srt_text, "自动检测", asr_model_type)
+            saved, prefix = save_outputs(file_path, full_text_with_punc, sent_json, srt_text, "自动检测", asr_model_type)
             if word_segments:
                 word_json_path = OUTPUT_DIR / f"{prefix}_words.json"
                 with open(word_json_path, 'w', encoding='utf-8') as f:
@@ -946,7 +1014,6 @@ def open_file_or_dir(path: str):
         subprocess.Popen(["xdg-open", path])
 
 def clear_cache_fully():
-    """清空缓存目录下的所有 .wav 文件"""
     count = 0
     for f in CACHE_DIR.glob("*.wav"):
         try:
@@ -956,7 +1023,7 @@ def clear_cache_fully():
             pass
     return f"已删除 {count} 个缓存文件"
 
-# ==================== 创建 Gradio 界面 ====================
+# ==================== 创建界面 ====================
 def create_interface():
     settings = manager.settings
     default_output_dir = settings.get("output_dir", str(DEFAULT_OUTPUT_DIR))
@@ -972,7 +1039,7 @@ def create_interface():
 
     with gr.Blocks(title="FireRedASR2S WebUI 专业版", theme=gr.themes.Default()) as demo:
         gr.Markdown(f"""
-        # FireRedASR2S 语音识别系统 专业版
+        # FireRedASR2S 语音识别系统 专业版（修复版）
         **支持 VAD、LID、标点恢复、四种时间戳预览及词级 JSON 输出**
         输出目录: `{OUTPUT_DIR}` | 缓存目录: `{CACHE_DIR}`
         """)
@@ -994,7 +1061,6 @@ def create_interface():
             return info
         health_btn.click(health_check, outputs=[status_display])
 
-        # ========== 布局：第一行 ASR 模型类型 + 操作提示 ==========
         with gr.Row():
             asr_model_type = gr.Dropdown(
                 label="ASR 模型类型",
@@ -1009,7 +1075,6 @@ def create_interface():
                 scale=3
             )
 
-        # ========== 第二行：加载/卸载按钮 + 所有复选框 ==========
         with gr.Row():
             load_btn = gr.Button("加载模型", variant="primary", scale=1)
             unload_btn = gr.Button("卸载模型", variant="stop", scale=1)
@@ -1060,7 +1125,7 @@ def create_interface():
 
         gr.Markdown("---")
         with gr.Tabs():
-            # ---------- 音频识别 ----------
+            # ===== 音频识别 =====
             with gr.Tab("音频识别"):
                 with gr.Row():
                     with gr.Column(scale=1):
@@ -1075,12 +1140,12 @@ def create_interface():
                         force_preprocess_check = gr.Checkbox(
                             label="⚡ 强制预处理为 16kHz 单声道 (推荐大文件)", value=True, interactive=True
                         )
-                        with gr.Accordion("字幕合并参数", open=True):
-                            enable_duration = gr.Checkbox(label="启用单条最大时长限制", value=True)
+                        with gr.Accordion("全局字幕合并参数", open=True):
+                            enable_duration = gr.Checkbox(label="启用单条最大时长限制", value=False)
                             merge_max_duration = gr.Slider(1.0, 20.0, 10.0, step=0.5, label="单条最大时长 (秒)")
-                            enable_charcount = gr.Checkbox(label="启用单条最大字符数限制", value=True)
+                            enable_charcount = gr.Checkbox(label="启用单条最大字符数限制", value=False)
                             merge_max_chars = gr.Slider(5, 100, 30, step=5, label="单条最大字符数")
-                            enable_silence = gr.Checkbox(label="启用静音阈值分句", value=True)
+                            enable_silence = gr.Checkbox(label="启用静音阈值分句", value=False)
                             merge_silence_threshold = gr.Slider(0.1, 1.0, 0.3, step=0.05, label="静音阈值 (秒)")
                             enable_punc_merge = gr.Checkbox(label="启用句末标点分句", value=True)
                             merge_punctuations = gr.Textbox(value="。！？.!?", label="句末标点")
@@ -1127,7 +1192,7 @@ def create_interface():
                              text_output, word_json_output, sent_json_output, srt_output]
                 )
 
-            # ---------- 视频字幕（增加强制预处理复选框）----------
+            # ===== 视频字幕（移除独立合并参数，使用全局） =====
             with gr.Tab("视频字幕"):
                 with gr.Row():
                     with gr.Column(scale=1):
@@ -1135,15 +1200,7 @@ def create_interface():
                         force_preprocess_video = gr.Checkbox(
                             label="⚡ 强制预处理音频 (推荐大文件)", value=False, interactive=True
                         )
-                        with gr.Accordion("字幕合并参数", open=True):
-                            v_enable_duration = gr.Checkbox(label="启用单条最大时长限制", value=True)
-                            v_merge_max_duration = gr.Slider(1.0, 20.0, 10.0, step=0.5, label="单条最大时长 (秒)")
-                            v_enable_charcount = gr.Checkbox(label="启用单条最大字符数限制", value=True)
-                            v_merge_max_chars = gr.Slider(5, 100, 30, step=5, label="单条最大字符数")
-                            v_enable_silence = gr.Checkbox(label="启用静音阈值分句", value=True)
-                            v_merge_silence_threshold = gr.Slider(0.1, 1.0, 0.3, step=0.05, label="静音阈值 (秒)")
-                            v_enable_punc = gr.Checkbox(label="启用句末标点分句", value=True)
-                            v_merge_punctuations = gr.Textbox(value="。！？.!?", label="句末标点")
+                        gr.Markdown("> 字幕合并参数使用上方「音频识别」Tab 中的全局设置")
                         with gr.Row():
                             video_transcribe_btn = gr.Button("提取字幕", variant="primary")
                             video_clear_btn = gr.Button("清空", variant="secondary")
@@ -1166,10 +1223,10 @@ def create_interface():
                             vad_min_speech_frame, vad_max_speech_frame, vad_min_silence_frame,
                             vad_speech_threshold, vad_smooth_window_size,
                             punc_threshold,
-                            v_enable_duration, v_merge_max_duration,
-                            v_enable_charcount, v_merge_max_chars,
-                            v_enable_punc, v_merge_punctuations,
-                            v_enable_silence, v_merge_silence_threshold,
+                            enable_duration, merge_max_duration,
+                            enable_charcount, merge_max_chars,
+                            enable_punc_merge, merge_punctuations,
+                            enable_silence, merge_silence_threshold,
                             force_preprocess_video],
                     outputs=[video_text_output, video_word_json_output, video_sent_json_output, video_srt_output]
                 ).then(refresh_status, outputs=[status_display])
@@ -1179,7 +1236,7 @@ def create_interface():
                     outputs=[video_input, video_text_output, video_word_json_output, video_sent_json_output, video_srt_output]
                 )
 
-            # ---------- 批量处理（添加独立合并参数）----------
+            # ===== 批量处理（使用全局合并参数） =====
             with gr.Tab("批量处理"):
                 with gr.Row():
                     with gr.Column(scale=1):
@@ -1190,19 +1247,7 @@ def create_interface():
                             type="filepath"
                         )
                         force_preprocess_batch = gr.Checkbox(label="⚡ 强制预处理", value=True)
-                        with gr.Accordion("字幕合并参数", open=True):
-                            with gr.Row():
-                                batch_enable_duration = gr.Checkbox(label="启用单条最大时长限制", value=True)
-                                batch_merge_max_duration = gr.Slider(1.0, 20.0, 10.0, step=0.5, label="单条最大时长 (秒)")
-                            with gr.Row():
-                                batch_enable_charcount = gr.Checkbox(label="启用单条最大字符数限制", value=True)
-                                batch_merge_max_chars = gr.Slider(5, 100, 30, step=5, label="单条最大字符数")
-                            with gr.Row():
-                                batch_enable_silence = gr.Checkbox(label="启用静音阈值分句", value=True)
-                                batch_merge_silence_threshold = gr.Slider(0.1, 1.0, 0.3, step=0.05, label="静音阈值 (秒)")
-                            with gr.Row():
-                                batch_enable_punc = gr.Checkbox(label="启用句末标点分句", value=True)
-                                batch_merge_punctuations = gr.Textbox(value="。！？.!?", label="句末标点")
+                        gr.Markdown("> 字幕合并参数使用上方「音频识别」Tab 中的全局设置")
                         with gr.Row():
                             batch_transcribe_btn = gr.Button("批量识别", variant="primary")
                             batch_clear = gr.Button("清空", variant="secondary")
@@ -1217,24 +1262,19 @@ def create_interface():
                             vad_min_speech_frame, vad_max_speech_frame, vad_min_silence_frame,
                             vad_speech_threshold, vad_smooth_window_size, punc_threshold,
                             force_preprocess_batch,
-                            batch_enable_duration, batch_merge_max_duration,
-                            batch_enable_charcount, batch_merge_max_chars,
-                            batch_enable_punc, batch_merge_punctuations,
-                            batch_enable_silence, batch_merge_silence_threshold],
+                            enable_duration, merge_max_duration,
+                            enable_charcount, merge_max_chars,
+                            enable_punc_merge, merge_punctuations,
+                            enable_silence, merge_silence_threshold],
                     outputs=[batch_output]
                 ).then(refresh_status, outputs=[status_display])
 
-                # 清空时重置所有控件（文件、结果、合并参数）
                 batch_clear.click(
-                    lambda: [None, "", True, 10.0, True, 30, True, "。！？.!?", True, 0.3],
-                    outputs=[file_input, batch_output,
-                             batch_enable_duration, batch_merge_max_duration,
-                             batch_enable_charcount, batch_merge_max_chars,
-                             batch_enable_punc, batch_merge_punctuations,
-                             batch_enable_silence, batch_merge_silence_threshold]
+                    lambda: [None, ""],
+                    outputs=[file_input, batch_output]
                 )
 
-            # ---------- 系统信息 ----------
+            # ===== 系统信息 =====
             with gr.Tab("系统信息"):
                 system_info_text = gr.Textbox(value=get_system_info(), lines=20, label="详细信息", show_copy_button=True)
                 with gr.Row():
@@ -1296,6 +1336,7 @@ def create_interface():
                         "enable_charcount": enable_charcount.value, "merge_max_chars": merge_max_chars.value,
                         "enable_punc_merge": enable_punc_merge.value, "merge_punctuations": merge_punctuations.value,
                         "enable_silence": enable_silence.value, "merge_silence_threshold": merge_silence_threshold.value,
+                        "force_preprocess": force_preprocess_check.value,
                     }
                     timestamp = time.strftime("%Y%m%d_%H%M%S")
                     preset_path = PRESET_DIR / f"preset_{timestamp}.json"
@@ -1314,14 +1355,16 @@ def create_interface():
                     "beam_size", "nbest", "decode_max_len", "softmax_smoothing", "aed_length_penalty", "eos_penalty", "elm_weight",
                     "vad_min_speech_frame", "vad_max_speech_frame", "vad_min_silence_frame", "vad_speech_threshold", "vad_smooth_window_size", "punc_threshold",
                     "enable_duration", "merge_max_duration", "enable_charcount", "merge_max_chars",
-                    "enable_punc_merge", "merge_punctuations", "enable_silence", "merge_silence_threshold"
+                    "enable_punc_merge", "merge_punctuations", "enable_silence", "merge_silence_threshold",
+                    "force_preprocess"
                 ]
                 _PARAM_DEFAULTS = {
                     "asr_model_type": "aed", "use_gpu": True, "use_half": False, "enable_vad": True, "enable_lid": True, "enable_punc": True,
                     "beam_size": 3, "nbest": 1, "decode_max_len": 0, "softmax_smoothing": 1.25, "aed_length_penalty": 0.6, "eos_penalty": 1.0, "elm_weight": 0.0,
                     "vad_min_speech_frame": 20, "vad_max_speech_frame": 2000, "vad_min_silence_frame": 20, "vad_speech_threshold": 0.4, "vad_smooth_window_size": 5, "punc_threshold": 0.45,
                     "enable_duration": True, "merge_max_duration": 10.0, "enable_charcount": True, "merge_max_chars": 30,
-                    "enable_punc_merge": True, "merge_punctuations": "。！？.!?", "enable_silence": True, "merge_silence_threshold": 0.3
+                    "enable_punc_merge": True, "merge_punctuations": "。！？.!?", "enable_silence": True, "merge_silence_threshold": 0.3,
+                    "force_preprocess": True
                 }
 
                 def load_selected_config(filename):
@@ -1333,10 +1376,10 @@ def create_interface():
                             cfg = json.load(f)
                     except Exception as e:
                         return [f"加载失败: {e}"] + [gr.update() for _ in _PARAM_KEYS]
-                    valid_models = model_choices
-                    if cfg.get("asr_model_type") not in valid_models:
-                        cfg["asr_model_type"] = "aed"
-                        msg = f"⚠️ 预设中的模型类型无效，已重置为 aed"
+                    # 验证模型类型
+                    if cfg.get("asr_model_type") not in model_choices:
+                        cfg["asr_model_type"] = model_choices[0]
+                        msg = f"⚠️ 预设中的模型类型无效，已重置为 {model_choices[0]}"
                     else:
                         msg = f"配置已加载: {filename}"
                     updates = [gr.update(value=cfg.get(key, _PARAM_DEFAULTS.get(key))) for key in _PARAM_KEYS]
@@ -1350,7 +1393,8 @@ def create_interface():
                              beam_size, nbest, decode_max_len, softmax_smoothing, aed_length_penalty, eos_penalty, elm_weight,
                              vad_min_speech_frame, vad_max_speech_frame, vad_min_silence_frame, vad_speech_threshold, vad_smooth_window_size, punc_threshold,
                              enable_duration, merge_max_duration, enable_charcount, merge_max_chars,
-                             enable_punc_merge, merge_punctuations, enable_silence, merge_silence_threshold]
+                             enable_punc_merge, merge_punctuations, enable_silence, merge_silence_threshold,
+                             force_preprocess_check]
                 )
 
         gr.Markdown("---")
