@@ -344,8 +344,12 @@ class FireRedASR2SManager:
                     data = np.mean(data, axis=1)
                 # 检测是否为整数格式，若是则归一化
                 if data.dtype.kind == 'i' or np.max(np.abs(data)) > 1.0:
+                    orig_dtype = data.dtype
                     data = data.astype(np.float32)
-                    max_val = np.iinfo(np.int16).max if data.dtype == np.int16 else np.max(np.abs(data))
+                    if np.issubdtype(orig_dtype, np.integer):
+                        max_val = float(np.iinfo(orig_dtype).max)
+                    else:
+                        max_val = np.max(np.abs(data))
                     data /= max_val
                 else:
                     data = data.astype(np.float32)
@@ -370,6 +374,13 @@ class FireRedASR2SManager:
             except subprocess.CalledProcessError as e:
                 error_detail = e.stderr.decode(errors='replace') if e.stderr else str(e)
                 logging.error(f"FFmpeg转换失败: {error_detail}")
+                # 清理已创建的输入临时文件
+                if need_cleanup_input and input_path in self.temp_files:
+                    self.temp_files.remove(str(input_path))
+                    try:
+                        os.unlink(str(input_path))
+                    except Exception:
+                        pass
                 return None
             self.temp_files.append(str(out_path))
 
@@ -491,21 +502,30 @@ def merge_timestamps_to_sentences(timestamps, words,
 
     for i, ((start, end), word) in enumerate(zip(timestamps, words)):
         should_break = False
+
         # 强制断句索引
         if force_break_indices and i < len(force_break_indices) and force_break_indices[i]:
             should_break = True
         else:
-            # 句末标点断句
-            if merge_by_punc and any(word.endswith(p) for p in sentence_endings):
-                should_break = True
-            # 静音阈值断句（仅当已有前词）
+            # 静音阈值断句（优先处理，且发生在当前词被加入之前）
             if not should_break and merge_by_silence and i > 0:
                 if start - last_end > silence_threshold:
-                    should_break = True
+                    # 先保存之前累积的句子
+                    if current_words:
+                        sentences.append({
+                            "start": current_start,
+                            "end": last_end,
+                            "text": join_str.join(current_words).strip()
+                        })
+                        current_words = []
+                        current_start = None
+            # 句末标点断句
+            if not should_break and merge_by_punc and any(word.endswith(p) for p in sentence_endings):
+                should_break = True
             # 词数限制
             if not should_break and merge_by_wordcount and len(current_words) + 1 >= max_words:
                 should_break = True
-            # 字符数限制（注意：如果当前只有一个词且已超长，此处无法触发，因此后续单独处理）
+            # 字符数限制
             if not should_break and merge_by_charcount and current_words:
                 new_text = join_str.join(current_words + [word])
                 if len(new_text) >= max_chars:
@@ -514,15 +534,14 @@ def merge_timestamps_to_sentences(timestamps, words,
             if not should_break and merge_by_duration and current_words:
                 if (last_end - current_start) + (end - start) >= max_duration:
                     should_break = True
+            # 处理第一个词超长的情况
+            if not should_break and not current_words:
+                if merge_by_charcount and len(word) >= max_chars:
+                    should_break = True
+                if merge_by_duration and (end - start) >= max_duration:
+                    should_break = True
 
-        # 处理第一个词超长的情况
-        if not should_break and not current_words:
-            # 单独检查单个词是否已经超过字符数或时长限制
-            if merge_by_charcount and len(word) >= max_chars:
-                should_break = True
-            if merge_by_duration and (end - start) >= max_duration:
-                should_break = True
-
+        # 如果当前还没有句子起始时间，设定
         if not current_words:
             current_start = start
         current_words.append(word)
@@ -661,33 +680,39 @@ def ensure_model_loaded(config_params, advanced_params):
 # ==================== 标点重新注入 ====================
 def inject_punctuation_to_words(word_segments, full_text_with_punc, punctuation_chars="。！？.!?"):
     """
-    将 full_text_with_punc 中的标点附加到对应的 word_segments 文本末尾。
-    假设 word_segments 的 text 顺序与去标点后的汉字序列一致。
+    将 full_text_with_punc 中的标点符号按位置插入到 word_segments 的词末尾。
+    遍历带标点的文本，维护一个当前词语索引，遇到汉字则推进词段索引，
+    遇到标点则附加到上一个词的 text 末尾。
     """
-    if not word_segments:
+    if not word_segments or not full_text_with_punc:
         return word_segments
-    # 提取所有汉字字符
-    han_chars = re.findall(r'[\u4e00-\u9fff]', full_text_with_punc)
-    if len(han_chars) != len(word_segments):
-        return word_segments  # 长度不匹配则跳过
-
-    # 构建一个带索引的标点位置映射
-    punct_positions = []
-    idx = 0
-    for ch in full_text_with_punc:
-        if ch in punctuation_chars:
-            punct_positions.append((idx, ch))
-        elif re.match(r'[\u4e00-\u9fff]', ch):
-            idx += 1
-        # 其他字符（如空格）忽略，可能影响索引，这里简单处理：只统计汉字
-    # 将标点分配给前一个汉字对应的 word_segment
+    # 构建标点集合
+    punct_set = set(punctuation_chars)
     seg_idx = 0
-    for (han_idx, punct_char) in punct_positions:
-        while seg_idx < len(word_segments) and seg_idx < han_idx:
-            seg_idx += 1
-        if seg_idx > 0:
-            # 标点附着到前一个词
-            word_segments[seg_idx - 1]["text"] += punct_char
+    # 将当前词的文本转换为字符序列用于匹配（去除标点后的纯汉字序列）
+    pure_chars = ''.join(seg['text'] for seg in word_segments)
+    han_idx = 0  # 当前在 pure_chars 中的位置
+    for ch in full_text_with_punc:
+        if ch in punct_set:
+            # 遇到标点，附加到前一个词（如果存在）
+            if seg_idx > 0:
+                word_segments[seg_idx - 1]['text'] += ch
+        elif re.match(r'[\u4e00-\u9fff]', ch):
+            # 汉字，应与 pure_chars[han_idx] 匹配
+            if han_idx < len(pure_chars) and ch == pure_chars[han_idx]:
+                # 判断这个词是否结束：看当前词段在纯汉字序列中的覆盖范围
+                seg_start = sum(len(word_segments[k]['text']) for k in range(seg_idx)) if seg_idx < len(word_segments) else 0
+                seg_end = seg_start + len(word_segments[seg_idx]['text'])
+                if han_idx >= seg_end:
+                    # 当前汉字已超出当前词段，移动到下一词段
+                    seg_idx += 1
+                    if seg_idx >= len(word_segments):
+                        break
+                han_idx += 1
+            else:
+                # 字符不匹配（可能空格、英文字母等），忽略或简单跳过
+                pass
+        # 其他字符（如空格）忽略
     return word_segments
 
 # ==================== 识别函数（音频、视频、批量均使用全局合并参数） ====================
@@ -1232,8 +1257,10 @@ def create_interface():
                 ).then(refresh_status, outputs=[status_display])
 
                 video_clear_btn.click(
-                    lambda: [None, "", "", "", ""],
-                    outputs=[video_input, video_text_output, video_word_json_output, video_sent_json_output, video_srt_output]
+                    lambda: [None, False, "", "", "", ""],
+                    outputs=[video_input, force_preprocess_video,
+                            video_text_output, video_word_json_output,
+                            video_sent_json_output, video_srt_output]
                 )
 
             # ===== 批量处理（使用全局合并参数） =====
@@ -1362,8 +1389,8 @@ def create_interface():
                     "asr_model_type": "aed", "use_gpu": True, "use_half": False, "enable_vad": True, "enable_lid": True, "enable_punc": True,
                     "beam_size": 3, "nbest": 1, "decode_max_len": 0, "softmax_smoothing": 1.25, "aed_length_penalty": 0.6, "eos_penalty": 1.0, "elm_weight": 0.0,
                     "vad_min_speech_frame": 20, "vad_max_speech_frame": 2000, "vad_min_silence_frame": 20, "vad_speech_threshold": 0.4, "vad_smooth_window_size": 5, "punc_threshold": 0.45,
-                    "enable_duration": True, "merge_max_duration": 10.0, "enable_charcount": True, "merge_max_chars": 30,
-                    "enable_punc_merge": True, "merge_punctuations": "。！？.!?", "enable_silence": True, "merge_silence_threshold": 0.3,
+                    "enable_duration": False, "merge_max_duration": 10.0, "enable_charcount": False, "merge_max_chars": 30,
+                    "enable_punc_merge": True, "merge_punctuations": "。！？.!?", "enable_silence": False, "merge_silence_threshold": 0.3,
                     "force_preprocess": True
                 }
 
