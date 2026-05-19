@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-FireRedASR2S WebUI pro 专业版
+FireRedASR2S WebUI pro 专业版（修正标点注入逻辑）
 
 Copyright 2026 光影的故事2018
 Licensed under the Apache License, Version 2.0
@@ -138,7 +138,6 @@ class FireRedASR2SManager:
         candidates = [
             ROOT_DIR / "pretrained_models" / f"FireRedASR2-{model_type_upper}",
             ROOT_DIR / "pretrained_models" / f"FireRedASR2-{model_type_upper}-2025",
-            # 回退到已知目录
             ROOT_DIR / "pretrained_models" / "FireRedASR2-AED",
             ROOT_DIR / "pretrained_models" / "FireRedASR2-AED-2025",
         ]
@@ -325,7 +324,6 @@ class FireRedASR2SManager:
     def _prepare_audio(self, audio_input, return_waveform=False, force_preprocess=True):
         """预处理音频为 16k 单声道 wav，归一化浮点数据"""
         try:
-            # 如果不强制预处理且输入已是理想格式，直接返回
             if not force_preprocess and isinstance(audio_input, str) and os.path.exists(audio_input):
                 try:
                     info = sf.info(audio_input)
@@ -337,12 +335,10 @@ class FireRedASR2SManager:
                 except:
                     pass
 
-            # 处理元组输入（麦克风/录音），归一化到 [-1, 1]
             if isinstance(audio_input, tuple):
                 sr, data = audio_input
                 if data.ndim > 1:
                     data = np.mean(data, axis=1)
-                # 检测是否为整数格式，若是则归一化
                 if data.dtype.kind == 'i' or np.max(np.abs(data)) > 1.0:
                     orig_dtype = data.dtype
                     data = data.astype(np.float32)
@@ -363,7 +359,6 @@ class FireRedASR2SManager:
             else:
                 return None
 
-            # 转码输出
             out_path = CACHE_DIR / f"temp_audio_{uuid.uuid4().hex}_{int(time.time())}.wav"
             cmd = [
                 FFMPEG_PATH, "-y", "-i", str(input_path),
@@ -374,7 +369,6 @@ class FireRedASR2SManager:
             except subprocess.CalledProcessError as e:
                 error_detail = e.stderr.decode(errors='replace') if e.stderr else str(e)
                 logging.error(f"FFmpeg转换失败: {error_detail}")
-                # 清理已创建的输入临时文件
                 if need_cleanup_input and input_path in self.temp_files:
                     self.temp_files.remove(str(input_path))
                     try:
@@ -434,7 +428,6 @@ def format_result_to_outputs(result):
     words = result.get("words", [])
     vad_segments = result.get("vad_segments_ms", [])
 
-    # 词级 segments 优先用 words，否则用 sentences
     word_segments = []
     if words:
         for w in words:
@@ -451,7 +444,6 @@ def format_result_to_outputs(result):
                 "text": s.get("text", "")
             })
 
-    # 句子级 segments（供直接输出）
     sent_segments = []
     if sentences:
         for s in sentences:
@@ -466,7 +458,6 @@ def format_result_to_outputs(result):
     word_json = json.dumps(word_segments, ensure_ascii=False, indent=2)
     sent_json = json.dumps(sent_segments, ensure_ascii=False, indent=2)
 
-    # SRT 基于句子级
     srt_lines = []
     for i, seg in enumerate(sent_segments, 1):
         start = seconds_to_srt_time(seg["start"])
@@ -502,15 +493,11 @@ def merge_timestamps_to_sentences(timestamps, words,
 
     for i, ((start, end), word) in enumerate(zip(timestamps, words)):
         should_break = False
-
-        # 强制断句索引
         if force_break_indices and i < len(force_break_indices) and force_break_indices[i]:
             should_break = True
         else:
-            # 静音阈值断句（优先处理，且发生在当前词被加入之前）
-            if not should_break and merge_by_silence and i > 0:
+            if merge_by_silence and i > 0:
                 if start - last_end > silence_threshold:
-                    # 先保存之前累积的句子
                     if current_words:
                         sentences.append({
                             "start": current_start,
@@ -519,29 +506,23 @@ def merge_timestamps_to_sentences(timestamps, words,
                         })
                         current_words = []
                         current_start = None
-            # 句末标点断句
             if not should_break and merge_by_punc and any(word.endswith(p) for p in sentence_endings):
                 should_break = True
-            # 词数限制
             if not should_break and merge_by_wordcount and len(current_words) + 1 >= max_words:
                 should_break = True
-            # 字符数限制
             if not should_break and merge_by_charcount and current_words:
                 new_text = join_str.join(current_words + [word])
                 if len(new_text) >= max_chars:
                     should_break = True
-            # 时长限制
             if not should_break and merge_by_duration and current_words:
                 if (last_end - current_start) + (end - start) >= max_duration:
                     should_break = True
-            # 处理第一个词超长的情况
             if not should_break and not current_words:
                 if merge_by_charcount and len(word) >= max_chars:
                     should_break = True
                 if merge_by_duration and (end - start) >= max_duration:
                     should_break = True
 
-        # 如果当前还没有句子起始时间，设定
         if not current_words:
             current_start = start
         current_words.append(word)
@@ -623,7 +604,6 @@ def get_system_info():
     info.append(f"缓存目录: {CACHE_DIR}")
     return "\n".join(info)
 
-# ==================== 显示截断 ====================
 def truncate_all_for_display(full_text, word_json, sent_json, srt_text,
                               text_limit=1000, word_item_limit=300, sent_item_limit=300, srt_line_limit=200):
     disp_text = full_text
@@ -677,45 +657,52 @@ def ensure_model_loaded(config_params, advanced_params):
                 raise RuntimeError(f"加载失败: {msg}")
     return manager
 
-# ==================== 标点重新注入 ====================
+# ==================== 标点注入（修正版）====================
 def inject_punctuation_to_words(word_segments, full_text_with_punc, punctuation_chars="。！？.!?"):
     """
-    将 full_text_with_punc 中的标点符号按位置插入到 word_segments 的词末尾。
-    遍历带标点的文本，维护一个当前词语索引，遇到汉字则推进词段索引，
-    遇到标点则附加到上一个词的 text 末尾。
+    将带标点的全文中的标点符号，精确附加到对应词的末尾。
+    算法：遍历全文，记录当前汉字所属的分词索引；遇到标点时，
+    将其附加到上一个完成的词（即上一个遇到的汉字所属的词）末尾。
     """
     if not word_segments or not full_text_with_punc:
         return word_segments
-    # 构建标点集合
     punct_set = set(punctuation_chars)
-    seg_idx = 0
-    # 将当前词的文本转换为字符序列用于匹配（去除标点后的纯汉字序列）
-    pure_chars = ''.join(seg['text'] for seg in word_segments)
-    han_idx = 0  # 当前在 pure_chars 中的位置
+    word_texts = [seg['text'] for seg in word_segments]
+
+    # 计算每个词在纯汉字序列中的起始位置
+    boundaries = []
+    total = 0
+    for t in word_texts:
+        boundaries.append(total)
+        total += len(t)
+
+    last_word_idx = -1
+    char_idx = 0   # 当前汉字在纯汉字序列中的索引
+
     for ch in full_text_with_punc:
         if ch in punct_set:
-            # 遇到标点，附加到前一个词（如果存在）
-            if seg_idx > 0:
-                word_segments[seg_idx - 1]['text'] += ch
+            if last_word_idx >= 0:
+                word_segments[last_word_idx]['text'] += ch
         elif re.match(r'[\u4e00-\u9fff]', ch):
-            # 汉字，应与 pure_chars[han_idx] 匹配
-            if han_idx < len(pure_chars) and ch == pure_chars[han_idx]:
-                # 判断这个词是否结束：看当前词段在纯汉字序列中的覆盖范围
-                seg_start = sum(len(word_segments[k]['text']) for k in range(seg_idx)) if seg_idx < len(word_segments) else 0
-                seg_end = seg_start + len(word_segments[seg_idx]['text'])
-                if han_idx >= seg_end:
-                    # 当前汉字已超出当前词段，移动到下一词段
-                    seg_idx += 1
-                    if seg_idx >= len(word_segments):
-                        break
-                han_idx += 1
+            if char_idx >= total:
+                break  # 汉字数量超出预期，安全退出
+            # 查找 char_idx 所属的词索引
+            for idx in range(len(boundaries)):
+                start = boundaries[idx]
+                end = start + len(word_texts[idx])
+                if char_idx >= start and char_idx < end:
+                    word_idx = idx
+                    break
             else:
-                # 字符不匹配（可能空格、英文字母等），忽略或简单跳过
-                pass
-        # 其他字符（如空格）忽略
+                # 理论上不会到这里，略过
+                continue
+            last_word_idx = word_idx
+            char_idx += 1
+        # 其他字符（如英文、空格）忽略
+
     return word_segments
 
-# ==================== 识别函数（音频、视频、批量均使用全局合并参数） ====================
+# ==================== 识别函数 ====================
 def transcribe_audio(audio, asr_model_type, use_gpu, use_half, enable_vad, enable_lid, enable_punc,
                      beam_size, nbest, decode_max_len, softmax_smoothing, aed_length_penalty,
                      eos_penalty, elm_weight,
@@ -1217,7 +1204,7 @@ def create_interface():
                              text_output, word_json_output, sent_json_output, srt_output]
                 )
 
-            # ===== 视频字幕（移除独立合并参数，使用全局） =====
+            # ===== 视频字幕 =====
             with gr.Tab("视频字幕"):
                 with gr.Row():
                     with gr.Column(scale=1):
@@ -1263,7 +1250,7 @@ def create_interface():
                             video_sent_json_output, video_srt_output]
                 )
 
-            # ===== 批量处理（使用全局合并参数） =====
+            # ===== 批量处理 =====
             with gr.Tab("批量处理"):
                 with gr.Row():
                     with gr.Column(scale=1):
@@ -1403,7 +1390,6 @@ def create_interface():
                             cfg = json.load(f)
                     except Exception as e:
                         return [f"加载失败: {e}"] + [gr.update() for _ in _PARAM_KEYS]
-                    # 验证模型类型
                     if cfg.get("asr_model_type") not in model_choices:
                         cfg["asr_model_type"] = model_choices[0]
                         msg = f"⚠️ 预设中的模型类型无效，已重置为 {model_choices[0]}"
